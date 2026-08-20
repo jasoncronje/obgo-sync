@@ -37,6 +37,9 @@ func (s *Service) Push(ctx context.Context, filter string) error {
 
 	// 3. Single-file shortcut.
 	if filter != "" && !strings.HasSuffix(filter, "/") {
+		if shouldSkipLocalPath(filter, s.syncHidden) {
+			return nil
+		}
 		absPath := filepath.Join(s.dataDir, filepath.FromSlash(filter))
 		if _, err := os.Stat(absPath); err != nil {
 			// File missing locally: tombstone the remote doc if it exists.
@@ -75,28 +78,21 @@ func (s *Service) Push(ctx context.Context, filter string) error {
 		if err != nil {
 			return err
 		}
-		name := d.Name()
 		if d.IsDir() {
-			// Skip hidden directories (.git, .obsidian, .claude, .trash, ...).
-			// The local watcher already ignores every dotted path, so without
-			// this the walk is inconsistent with watch mode — and a full push
-			// would upload e.g. the entire .git object store into the vault
-			// database and out to every synced device. walkRoot itself is never
-			// skipped, so an explicitly requested dotted filter still works.
-			if path != walkRoot && strings.HasPrefix(name, ".") {
+			if path != walkRoot && shouldSkipLocalName(d.Name(), s.syncHidden) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		// Skip hidden files, which also covers obgo's own .obgo* state files.
-		if strings.HasPrefix(name, ".") {
+		relPath, _ := filepath.Rel(s.dataDir, path)
+		relPath = filepath.ToSlash(relPath)
+		if shouldSkipLocalPath(relPath, s.syncHidden) {
 			return nil
 		}
 		if err := s.pushFile(ctx, path); err != nil {
 			return err
 		}
-		relPath, _ := filepath.Rel(s.dataDir, path)
-		pushedPaths[filepath.ToSlash(relPath)] = struct{}{}
+		pushedPaths[relPath] = struct{}{}
 		count++
 		if s.OnPushFile != nil {
 			s.OnPushFile(count)
@@ -111,6 +107,9 @@ func (s *Service) Push(ctx context.Context, filter string) error {
 	for _, remote := range remoteDocs {
 		if remote.IsDeleted() {
 			continue // already tombstoned
+		}
+		if shouldSkipLocalPath(remote.Path, s.syncHidden) {
+			continue
 		}
 		// Only reconcile paths inside the walked scope.
 		if filter != "" && !strings.HasPrefix(remote.Path, filter) {
