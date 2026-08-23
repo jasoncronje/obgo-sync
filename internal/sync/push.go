@@ -37,7 +37,10 @@ func (s *Service) Push(ctx context.Context, filter string) error {
 
 	// 3. Single-file shortcut.
 	if filter != "" && !strings.HasSuffix(filter, "/") {
-		if shouldSkipLocalPath(filter, s.syncHidden) {
+		// A single named file is always evaluated as hidden-or-not on its own
+		// merits (no filterRoot exemption) — naming one hidden file explicitly
+		// does not opt it in.
+		if shouldSkipLocalPath(filter, "", s.syncHidden) {
 			return nil
 		}
 		absPath := filepath.Join(s.dataDir, filepath.FromSlash(filter))
@@ -69,8 +72,10 @@ func (s *Service) Push(ctx context.Context, filter string) error {
 
 	// 4. Walk a directory (whole vault or a folder prefix).
 	walkRoot := s.dataDir
+	walkFilter := "" // vault-relative filter, trailing slash trimmed
 	if filter != "" {
 		walkRoot = filepath.Join(s.dataDir, filepath.FromSlash(filter))
+		walkFilter = strings.TrimSuffix(filter, "/")
 	}
 	pushedPaths := make(map[string]struct{})
 	var count int
@@ -79,14 +84,18 @@ func (s *Service) Push(ctx context.Context, filter string) error {
 			return err
 		}
 		if d.IsDir() {
-			if path != walkRoot && shouldSkipLocalName(d.Name(), s.syncHidden) {
+			// Protected names (.git, .obgo*) are pruned even at walkRoot itself;
+			// hidden-but-not-protected names are only pruned below walkRoot, so
+			// an explicitly requested hidden folder (e.g. "obgo push .obsidian/")
+			// still works without OBGO_SYNC_HIDDEN.
+			if isProtectedLocalName(d.Name()) || (path != walkRoot && shouldSkipLocalName(d.Name(), s.syncHidden)) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 		relPath, _ := filepath.Rel(s.dataDir, path)
 		relPath = filepath.ToSlash(relPath)
-		if shouldSkipLocalPath(relPath, s.syncHidden) {
+		if shouldSkipLocalPath(relPath, walkFilter, s.syncHidden) {
 			return nil
 		}
 		if err := s.pushFile(ctx, path); err != nil {
@@ -108,7 +117,7 @@ func (s *Service) Push(ctx context.Context, filter string) error {
 		if remote.IsDeleted() {
 			continue // already tombstoned
 		}
-		if shouldSkipLocalPath(remote.Path, s.syncHidden) {
+		if shouldSkipLocalPath(remote.Path, walkFilter, s.syncHidden) {
 			continue
 		}
 		// Only reconcile paths inside the walked scope.
