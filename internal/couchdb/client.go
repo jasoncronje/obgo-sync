@@ -176,6 +176,16 @@ func (c *HTTPClient) postJSON(ctx context.Context, rawURL string, body interface
 // AllMetaDocs fetches file metadata and file tombstones from CouchDB while
 // excluding chunk and LiveSync-internal namespaces.
 func (c *HTTPClient) AllMetaDocs(ctx context.Context) ([]MetaDoc, error) {
+	return c.allMetaDocs(ctx, false)
+}
+
+// AllPullMetaDocs also includes LiveSync hidden-file metadata. Writers keep
+// using AllMetaDocs so read-only support cannot reconcile internal documents.
+func (c *HTTPClient) AllPullMetaDocs(ctx context.Context) ([]MetaDoc, error) {
+	return c.allMetaDocs(ctx, true)
+}
+
+func (c *HTTPClient) allMetaDocs(ctx context.Context, includeInternal bool) ([]MetaDoc, error) {
 	rawURL := c.dbURL("_all_docs") + "?include_docs=true&conflicts=true"
 	var result struct {
 		Rows []struct {
@@ -191,7 +201,7 @@ func (c *HTTPClient) AllMetaDocs(ctx context.Context) ([]MetaDoc, error) {
 		if row.Doc == nil {
 			continue
 		}
-		if isNonFileDocID(row.Doc.ID) {
+		if isNonFileDocID(row.Doc.ID) && !(includeInternal && strings.HasPrefix(row.Doc.ID, "i:")) {
 			continue
 		}
 		if row.Doc.Deleted {

@@ -26,7 +26,25 @@ The app is configured via environment variables (or a `.env` file in the working
 | `E2EE_PASSWORD` | no       | End-to-end encryption passphrase. Must match the passphrase configured in the Obsidian Livesync plugin if E2EE is enabled. |
 | `OBGO_DATA`     | yes      | Absolute path to the local vault directory on disk. |
 | `OBGO_PATH_OBFUSCATION` | no | Set to `on`, `off`, or `auto` (default). When enabled, file paths and metadata are encrypted in CouchDB. Only applicable when `E2EE_PASSWORD` is set. |
-| `OBGO_SYNC_HIDDEN` | no | Set to `true` to watch and push local dotfiles and dot-directories. Internal `.obgo*` paths and `.git` are always ignored. |
+| `OBGO_SYNC_HIDDEN` | no | Set to `true` to sync dotfiles and receive LiveSync `i:` hidden-file documents. Internal `.obgo*` paths and `.git` are always ignored. |
+
+LiveSync `i:` documents are supported for pull and remote watch only. Paths are
+mapped into the vault after decryption; chunk bodies use the existing decoder.
+Existing local symlinks are preserved and skipped; canonical paths sync normally.
+An `i:` document owns its local path, including after deletion. Pull and remote
+watch consistently ignore competing ordinary documents at that path. Explicit
+pushes of owned paths fail with a receive-only error; bulk pushes skip them and
+local watch refuses their uploads and deletions. Ordinary files retain their
+existing upload behavior. This does not add bidirectional `i:` support.
+
+Ownership is persisted in `.obgo_internal_paths` so hashed deletions work across
+restarts. Failed remote events (including conflicts, unavailable chunks and
+unsupported embedded `eden` chunks) are retained with their error in
+`.obgo_pending`. The watcher retries current remote revisions every five seconds
+and after restart. Unrelated files continue syncing; no checkpoint advances
+until an event succeeds or its failure is durably queued. Single-file pulls still
+return an error if that file cannot be applied. Conflicts require resolution in
+LiveSync, and embedded chunks require additional format support.
 
 A minimal `.env` file:
 

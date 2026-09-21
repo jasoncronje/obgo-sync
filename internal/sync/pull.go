@@ -3,12 +3,14 @@ package sync
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/jookos/obgo-sync/internal/couchdb"
+	"github.com/jookos/obgo-sync/internal/watcher"
 	"github.com/jookos/obgo-sync/lib/livesync"
 )
 
@@ -23,17 +25,31 @@ func (s *Service) Pull(ctx context.Context, filter string) error {
 	}
 
 	// 2. Fetch all meta docs; detect + handle obfuscation before any filtering.
-	docs, err := s.db.AllMetaDocs(ctx)
+	var docs []couchdb.MetaDoc
+	var err error
+	if reader, ok := s.db.(interface {
+		AllPullMetaDocs(context.Context) ([]couchdb.MetaDoc, error)
+	}); ok && s.syncHidden {
+		docs, err = reader.AllPullMetaDocs(ctx)
+	} else {
+		docs, err = s.db.AllMetaDocs(ctx)
+	}
 	if err != nil {
 		return fmt.Errorf("pull: list docs: %w", err)
 	}
 	s.detectObfuscation(docs)
 	s.decryptDocPaths(docs)
+	if err := s.rememberInternal(docs); err != nil {
+		return fmt.Errorf("persist internal ownership: %w", err)
+	}
 
 	// 3. Single-file shortcut: find the requested doc in the already-loaded list.
 	if filter != "" && !strings.HasSuffix(filter, "/") {
 		for _, doc := range docs {
-			if doc.Path == filter {
+			if !strings.HasPrefix(doc.ID, "i:") && s.internalOwnsDoc(doc.ID, doc.Path) {
+				continue
+			}
+			if strings.TrimPrefix(doc.Path, "i:") == filter {
 				resolved, rerr := s.resolveConflicts(ctx, doc)
 				if rerr != nil {
 					fmt.Fprintf(os.Stderr, "pull: resolve conflicts %q: %v\n", doc.Path, rerr)
@@ -54,7 +70,10 @@ func (s *Service) Pull(ctx context.Context, filter string) error {
 	// 4. For each meta doc, apply to disk (skipping those outside the folder filter).
 	var count int
 	for _, doc := range docs {
-		if filter != "" && !strings.HasPrefix(doc.Path, filter) {
+		if !strings.HasPrefix(doc.ID, "i:") && s.internalOwnsDoc(doc.ID, doc.Path) {
+			continue
+		}
+		if filter != "" && !strings.HasPrefix(strings.TrimPrefix(doc.Path, "i:"), filter) {
 			continue
 		}
 		resolved, rerr := s.resolveConflicts(ctx, doc)
@@ -63,6 +82,13 @@ func (s *Service) Pull(ctx context.Context, filter string) error {
 			resolved = doc
 		}
 		if err := s.applyRemoteDoc(ctx, resolved); err != nil {
+			if strings.HasPrefix(doc.ID, "i:") {
+				if qerr := watcher.DeferEvent(s.dataDir, couchdb.ChangeEvent{ID: doc.ID, Doc: &doc}, err); qerr != nil {
+					return qerr
+				}
+				fmt.Fprintf(os.Stderr, "pull: deferred %q: %v\n", doc.ID, err)
+				continue
+			}
 			return fmt.Errorf("pull: apply %q: %w", doc.Path, err)
 		}
 		count++
@@ -79,6 +105,9 @@ func (s *Service) Pull(ctx context.Context, filter string) error {
 // CouchDB tombstone _deleted:true or a Livesync app-level deleted:true field),
 // the corresponding local file is removed instead.
 func (s *Service) applyRemoteDoc(ctx context.Context, doc couchdb.MetaDoc) error {
+	if err := s.loadInternalState(); err != nil {
+		return err
+	}
 	// Decrypt obfuscated path field ("/\:" prefix) if present.
 	// decryptDocPaths does this in bulk for the main loop, but watch mode and
 	// conflict-resolved docs may call applyRemoteDoc directly.
@@ -106,6 +135,57 @@ func (s *Service) applyRemoteDoc(ctx context.Context, doc couchdb.MetaDoc) error
 		}
 	}
 
+	if strings.HasPrefix(doc.ID, "i:") {
+		if !s.syncHidden {
+			return nil
+		}
+		path := strings.TrimPrefix(doc.Path, "i:")
+		if path == "" {
+			path = strings.TrimPrefix(doc.ID, "i:")
+		}
+		// Hashed tombstones have no recoverable path. Never treat a hash as a filename.
+		if livesync.IsObfuscatedDocID(path) {
+			known, ok := s.internalPaths.Load(doc.ID)
+			if !ok {
+				return fmt.Errorf("internal tombstone %q has no persisted path", doc.ID)
+			}
+			path = known.(string)
+		}
+		if err := validateInternalPath(s.dataDir, path); err != nil {
+			if errors.Is(err, errInternalSymlink) {
+				// Keep local aliases intact; their canonical files sync separately.
+				return nil
+			}
+			return err
+		}
+		doc.Path = path
+		if shouldSkipLocalPath(path, "", s.syncHidden) {
+			return nil
+		}
+		if err := s.rememberInternal([]couchdb.MetaDoc{doc}); err != nil {
+			return err
+		}
+		if len(doc.Conflicts) > 0 {
+			return fmt.Errorf("internal file %q has unresolved conflicts", doc.ID)
+		}
+		if !doc.IsDeleted() && len(doc.Eden) > 0 {
+			return fmt.Errorf("internal file %q uses unsupported embedded chunks", doc.ID)
+		}
+	} else {
+		if s.internalOwnsDoc(doc.ID, doc.Path) {
+			return nil
+		}
+		if doc.Path != "" {
+			owned, err := s.checkInternalOwner(ctx, doc.Path)
+			if err != nil {
+				return err
+			}
+			if owned {
+				return nil
+			}
+		}
+	}
+
 	// Handle remote deletions: remove the local file.
 	if doc.Deleted || doc.DeletedApp {
 		// Lean tombstones (from Obsidian/PouchDB HTTP DELETE) have no path field;
@@ -129,7 +209,9 @@ func (s *Service) applyRemoteDoc(ctx context.Context, doc couchdb.MetaDoc) error
 		// and the original-cased path stored on a case-sensitive filesystem.
 		absPath := resolveCase(s.dataDir, path)
 		s.suppress.Add(absPath)
-		_ = os.Remove(absPath)
+		if err := os.Remove(absPath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 		if s.OnDeleteFile != nil {
 			s.OnDeleteFile(path)
 		}

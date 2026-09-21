@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jookos/obgo-sync/internal/couchdb"
@@ -14,6 +15,10 @@ import (
 // rewrites it as the current revision if needed, and tombstones all losing branches.
 // Returns the authoritative MetaDoc to apply to disk.
 func (s *Service) resolveConflicts(ctx context.Context, doc couchdb.MetaDoc) (couchdb.MetaDoc, error) {
+	// Internal-file support is receive-only: leave revision resolution to LiveSync.
+	if strings.HasPrefix(doc.ID, "i:") {
+		return doc, nil
+	}
 	if len(doc.Conflicts) == 0 {
 		return doc, nil
 	}

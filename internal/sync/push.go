@@ -29,14 +29,29 @@ func (s *Service) Push(ctx context.Context, filter string) error {
 
 	// 2. Pre-load remote docs to detect obfuscation mode and to reuse for reconcile.
 	remoteDocs, err := s.db.AllMetaDocs(ctx)
+	if reader, ok := s.db.(interface {
+		AllPullMetaDocs(context.Context) ([]couchdb.MetaDoc, error)
+	}); ok {
+		remoteDocs, err = reader.AllPullMetaDocs(ctx)
+	}
 	if err != nil {
 		return fmt.Errorf("push: list remote: %w", err)
 	}
 	s.detectObfuscation(remoteDocs)
 	s.decryptDocPaths(remoteDocs)
+	if err := s.rememberInternal(remoteDocs); err != nil {
+		return err
+	}
 
 	// 3. Single-file shortcut.
 	if filter != "" && !strings.HasSuffix(filter, "/") {
+		owned, err := s.checkInternalOwner(ctx, filter)
+		if err != nil {
+			return err
+		}
+		if owned {
+			return fmt.Errorf("%w: %s", ErrReceiveOnly, filter)
+		}
 		// A single named file is always evaluated as hidden-or-not on its own
 		// merits (no filterRoot exemption) — naming one hidden file explicitly
 		// does not opt it in.
@@ -95,6 +110,9 @@ func (s *Service) Push(ctx context.Context, filter string) error {
 		}
 		relPath, _ := filepath.Rel(s.dataDir, path)
 		relPath = filepath.ToSlash(relPath)
+		if s.internalOwns(relPath) {
+			return nil
+		}
 		if shouldSkipLocalPath(relPath, walkFilter, s.syncHidden) {
 			return nil
 		}
@@ -114,6 +132,9 @@ func (s *Service) Push(ctx context.Context, filter string) error {
 	// 5. Reconcile: tombstone remote docs that no longer exist locally.
 	// remoteDocs was already loaded and paths decrypted in step 2.
 	for _, remote := range remoteDocs {
+		if strings.HasPrefix(remote.ID, "i:") || s.internalOwns(remote.Path) {
+			continue
+		}
 		if remote.IsDeleted() {
 			continue // already tombstoned
 		}
@@ -221,6 +242,13 @@ func (s *Service) pushFile(ctx context.Context, absPath string) error {
 		return err
 	}
 	relPath = filepath.ToSlash(relPath)
+	owned, err := s.checkInternalOwner(ctx, relPath)
+	if err != nil {
+		return err
+	}
+	if owned {
+		return fmt.Errorf("%w: %s", ErrReceiveOnly, relPath)
+	}
 
 	// Determine doc type: plain (text) or newnote (binary).
 	isText := utf8.Valid(content)

@@ -151,6 +151,10 @@ func TestHTTPClient_AllMetaDocs_SkipsNonFileNamespaces(t *testing.T) {
 	if docs[0].ID != "f:actual" || docs[1].ID != "gone.md" {
 		t.Fatalf("unexpected document IDs: %q, %q", docs[0].ID, docs[1].ID)
 	}
+	docs, err = c.AllPullMetaDocs(context.Background())
+	if err != nil || len(docs) != 4 {
+		t.Fatalf("pull must include internal files and tombstones: %#v, %v", docs, err)
+	}
 }
 
 func TestHTTPClient_Changes_SkipsHeartbeats(t *testing.T) {

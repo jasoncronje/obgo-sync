@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	stdsync "sync"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/jookos/obgo-sync/internal/couchdb"
@@ -22,19 +23,25 @@ var ErrNotImplemented = errors.New("not implemented")
 
 // Service orchestrates pull, push, and watch operations.
 type Service struct {
-	db               couchdb.Client
-	crypto           *crypto.Service
-	dataDir          string
-	suppress         *watcher.SuppressSet
-	obfuscated       bool   // true when the remote vault uses path obfuscation
-	obfuscationMode  string // "auto" | "on" | "off"; set by SetObfuscationMode
-	syncHidden       bool
-	OnPullFile       func(n int)
-	OnPushFile       func(n int)
-	OnWatchEvent     func(path string, toRemote bool)
-	OnDeleteFile     func(path string)
-	OnTombstone      func(path string)
-	OnRawChangeEvent func(event couchdb.ChangeEvent)
+	db                 couchdb.Client
+	crypto             *crypto.Service
+	dataDir            string
+	suppress           *watcher.SuppressSet
+	obfuscated         bool   // true when the remote vault uses path obfuscation
+	obfuscationMode    string // "auto" | "on" | "off"; set by SetObfuscationMode
+	syncHidden         bool
+	internalPaths      stdsync.Map // document ID -> local path, for lean watch tombstones
+	internalOwnerPaths stdsync.Map // case-folded local path -> ownership
+	internalOwnerIDs   stdsync.Map // competing ordinary document ID -> ownership
+	internalStateOnce  stdsync.Once
+	internalStateMu    stdsync.Mutex
+	internalStateErr   error
+	OnPullFile         func(n int)
+	OnPushFile         func(n int)
+	OnWatchEvent       func(path string, toRemote bool)
+	OnDeleteFile       func(path string)
+	OnTombstone        func(path string)
+	OnRawChangeEvent   func(event couchdb.ChangeEvent)
 }
 
 // New creates a new sync Service.
@@ -173,6 +180,14 @@ func (s *Service) tombstonePrefix(ctx context.Context, prefix string) {
 		if doc.IsDeleted() || !strings.HasPrefix(doc.Path, prefix) {
 			continue
 		}
+		owned, err := s.checkInternalOwner(ctx, doc.Path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "watch: ownership check: %v\n", err)
+			continue
+		}
+		if owned {
+			continue
+		}
 		// Re-fetch the raw document: decryptDocPaths replaced Path with the
 		// cleartext path in place and PutMeta serialises verbatim, so writing
 		// this copy back would leak the path on an obfuscated vault.
@@ -197,6 +212,9 @@ func (s *Service) tombstonePrefix(ctx context.Context, prefix string) {
 // Watch starts the local and/or remote watcher depending on the flags.
 // Blocks until ctx is cancelled.
 func (s *Service) Watch(ctx context.Context, watchLocal, watchRemote bool) error {
+	if err := s.loadInternalState(); err != nil {
+		return err
+	}
 	if !watchLocal && !watchRemote {
 		return nil
 	}
@@ -204,6 +222,27 @@ func (s *Service) Watch(ctx context.Context, watchLocal, watchRemote bool) error
 	remoteOnEvent := func(ctx context.Context, event couchdb.ChangeEvent) error {
 		if s.OnRawChangeEvent != nil {
 			s.OnRawChangeEvent(event)
+		}
+		if strings.HasPrefix(event.ID, "i:") {
+			if !s.syncHidden {
+				return nil
+			}
+			doc := couchdb.MetaDoc{ID: event.ID, Deleted: event.Deleted}
+			if event.Doc != nil {
+				doc = *event.Doc
+				doc.ID = event.ID
+				doc.Deleted = doc.Deleted || event.Deleted
+			}
+			if !doc.IsDeleted() && doc.Type != "plain" && doc.Type != "newnote" {
+				return nil
+			}
+			if err := s.applyRemoteDoc(ctx, doc); err != nil {
+				return err
+			}
+			if path, ok := s.internalPaths.Load(doc.ID); ok && !doc.IsDeleted() && s.OnWatchEvent != nil && !shouldSkipLocalPath(path.(string), "", s.syncHidden) {
+				s.OnWatchEvent(path.(string), false)
+			}
+			return nil
 		}
 		// Skip true non-file documents (chunks h:..., internal i:..., ix:...).
 		// f: docs are obfuscated file meta-docs and must NOT be skipped here.
@@ -250,11 +289,23 @@ func (s *Service) Watch(ctx context.Context, watchLocal, watchRemote bool) error
 		if path == "" || livesync.IsObfuscatedDocID(path) {
 			return nil
 		}
+		if s.internalOwnsDoc(event.ID, path) {
+			return nil
+		}
+		owned, err := s.checkInternalOwner(ctx, path)
+		if err != nil {
+			return err
+		}
+		if owned {
+			return nil
+		}
 
 		if event.Deleted {
 			absPath := resolveCase(s.dataDir, path)
 			s.suppress.Add(absPath)
-			_ = os.Remove(absPath)
+			if err := os.Remove(absPath); err != nil && !os.IsNotExist(err) {
+				return err
+			}
 			if s.OnDeleteFile != nil {
 				s.OnDeleteFile(path)
 			}
@@ -295,6 +346,15 @@ func (s *Service) Watch(ctx context.Context, watchLocal, watchRemote bool) error
 			return
 		}
 		relPath = filepath.ToSlash(relPath)
+		owned, err := s.checkInternalOwner(ctx, relPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "watch: ownership check: %v\n", err)
+			return
+		}
+		if owned {
+			fmt.Fprintf(os.Stderr, "watch: %s: %v\n", relPath, ErrReceiveOnly)
+			return
+		}
 		// Must use the obfuscation-aware encoder: on a path-obfuscated vault the
 		// document ID is "f:<sha256>", not the plain lowercased path. Using the
 		// plain ID here made GetMeta return ErrNotFound for every delete, so
