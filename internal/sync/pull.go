@@ -208,6 +208,15 @@ func (s *Service) applyRemoteDoc(ctx context.Context, doc couchdb.MetaDoc) error
 		// resolveCase handles case mismatches between the lowercase doc ID
 		// and the original-cased path stored on a case-sensitive filesystem.
 		absPath := resolveCase(s.dataDir, path)
+		if strings.HasPrefix(doc.ID, "i:") {
+			keep, err := s.keepLocalInternal(ctx, absPath, doc, nil)
+			if err != nil {
+				return err
+			}
+			if keep {
+				return nil
+			}
+		}
 		s.suppress.Add(absPath)
 		if err := os.Remove(absPath); err != nil && !os.IsNotExist(err) {
 			return err
@@ -230,11 +239,27 @@ func (s *Service) applyRemoteDoc(ctx context.Context, doc couchdb.MetaDoc) error
 
 	// Write to disk.
 	absPath := filepath.Join(s.dataDir, filepath.FromSlash(doc.Path))
+	internal := strings.HasPrefix(doc.ID, "i:")
+	if internal {
+		keep, err := s.keepLocalInternal(ctx, absPath, doc, content)
+		if err != nil {
+			return err
+		}
+		if keep {
+			return nil
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
 	s.suppress.Add(absPath)
-	return os.WriteFile(absPath, content, 0o644)
+	if err := os.WriteFile(absPath, content, 0o644); err != nil {
+		return err
+	}
+	if internal && s.internalPushEnabled() {
+		alignInternalMTime(absPath, doc)
+	}
+	return nil
 }
 
 // readRemoteContent fetches a meta doc's chunks and assembles the file content.

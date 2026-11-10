@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jookos/obgo-sync/internal/couchdb"
 	"github.com/jookos/obgo-sync/internal/crypto"
@@ -227,6 +228,125 @@ func TestWatchInternalSkipsOwnRevision(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(filepath.Join(root, rel)); string(got) != "from elsewhere" {
 		t.Fatalf("remote revision was not applied: %q", got)
+	}
+}
+
+// pullDoc is the remote i: document the pull tests reconcile against.
+func pullDoc(db *mockClient, rel, content string, mtime int64) {
+	db.chunkDocs["h:remote"] = couchdb.ChunkDoc{ID: "h:remote", Data: content}
+	db.metaDocs = []couchdb.MetaDoc{{ID: "i:f:one", Rev: "3-abc", Path: "i:" + rel, Type: "plain", Size: int64(len(content)), MTime: mtime, Children: []string{"h:remote"}}}
+}
+
+func TestPullInternalKeepsNewerLocalEdit(t *testing.T) {
+	root := t.TempDir()
+	db := newMockClient()
+	rel := ".codex/notes.md"
+	pullDoc(db, rel, "remote", time.Now().Add(-time.Hour).UnixMilli())
+	writeHidden(t, root, rel, "edited while stopped")
+	s := newInternalPushService(db, crypto.New(""), root)
+	if err := s.Pull(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(root, rel)); string(got) != "edited while stopped" {
+		t.Fatalf("pull replaced a newer local edit: %q", got)
+	}
+	if len(db.putMetaDocs) != 1 || db.putMetaDocs[0].ID != "i:f:one" || db.putMetaDocs[0].Size != int64(len("edited while stopped")) {
+		t.Fatalf("newer local edit was not uploaded: %+v", db.putMetaDocs)
+	}
+}
+
+func TestPullInternalAppliesNewerRemote(t *testing.T) {
+	root := t.TempDir()
+	db := newMockClient()
+	rel := ".codex/notes.md"
+	remoteMTime := time.Now().Add(-time.Minute).UnixMilli()
+	pullDoc(db, rel, "remote", remoteMTime)
+	writeHidden(t, root, rel, "stale local")
+	old := time.Now().Add(-24 * time.Hour)
+	if err := os.Chtimes(filepath.Join(root, rel), old, old); err != nil {
+		t.Fatal(err)
+	}
+	s := newInternalPushService(db, crypto.New(""), root)
+	if err := s.Pull(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(root, rel)); string(got) != "remote" {
+		t.Fatalf("newer remote version was not applied: %q", got)
+	}
+	info, err := os.Stat(filepath.Join(root, rel))
+	if err != nil || info.ModTime().UnixMilli()/1000 != remoteMTime/1000 {
+		t.Fatalf("pulled file does not carry the document mtime: %v %v", info.ModTime(), err)
+	}
+	if db.putMetaCalled {
+		t.Fatal("applying a remote version produced a remote write")
+	}
+}
+
+func TestPullInternalLeavesMatchingFileAlone(t *testing.T) {
+	root := t.TempDir()
+	db := newMockClient()
+	rel := ".codex/notes.md"
+	remoteMTime := time.Now().Add(-time.Hour).UnixMilli()
+	pullDoc(db, rel, "same", remoteMTime)
+	writeHidden(t, root, rel, "same")
+	s := newInternalPushService(db, crypto.New(""), root)
+	if err := s.Pull(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(root, rel))
+	if err != nil || info.ModTime().UnixMilli()/1000 != remoteMTime/1000 {
+		t.Fatalf("matching file was not aligned to the document mtime: %v %v", info.ModTime(), err)
+	}
+	if db.putMetaCalled || db.bulkDocsCalled {
+		t.Fatal("matching file produced remote writes")
+	}
+}
+
+func TestPullInternalDeletion(t *testing.T) {
+	for name, tc := range map[string]struct {
+		tombstoneAge time.Duration
+		wantKept     bool
+	}{
+		"edited after the deletion":   {time.Hour, true},
+		"deleted after the last edit": {-time.Hour, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			db := newMockClient()
+			rel := ".codex/notes.md"
+			db.metaDocs = []couchdb.MetaDoc{{ID: "i:f:one", Rev: "5-abc", Path: "i:" + rel, Type: "plain", DeletedApp: true, MTime: time.Now().Add(-tc.tombstoneAge).UnixMilli(), Children: []string{}}}
+			writeHidden(t, root, rel, "local")
+			s := newInternalPushService(db, crypto.New(""), root)
+			if err := s.Pull(context.Background(), ""); err != nil {
+				t.Fatal(err)
+			}
+			_, err := os.Stat(filepath.Join(root, rel))
+			if kept := err == nil; kept != tc.wantKept {
+				t.Fatalf("kept=%v, want %v", kept, tc.wantKept)
+			}
+			if uploaded := len(db.putMetaDocs) == 1 && !db.putMetaDocs[0].IsDeleted(); uploaded != tc.wantKept {
+				t.Fatalf("uploaded=%v, want %v: %+v", uploaded, tc.wantKept, db.putMetaDocs)
+			}
+		})
+	}
+}
+
+func TestPushInternalKeepsDocumentForCaseVariant(t *testing.T) {
+	root := t.TempDir()
+	db := newMockClient()
+	db.chunkDocs["h:a"] = couchdb.ChunkDoc{ID: "h:a", Data: "kept"}
+	db.metaDocs = []couchdb.MetaDoc{{ID: "i:f:one", Path: "i:.codex/Notes.md", Type: "plain", Size: 4, Children: []string{"h:a"}}}
+	writeHidden(t, root, ".codex/Notes.md", "kept")
+	s := newInternalPushService(db, crypto.New(""), root)
+	// On a case-sensitive filesystem this path is missing, but its document is
+	// the one that still backs Notes.md.
+	if err := s.Push(context.Background(), ".codex/notes.md"); err != nil {
+		t.Fatal(err)
+	}
+	for _, doc := range db.putMetaDocs {
+		if doc.IsDeleted() {
+			t.Fatalf("document of a case-variant file was tombstoned: %+v", doc)
+		}
 	}
 }
 

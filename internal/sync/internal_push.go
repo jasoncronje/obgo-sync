@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -82,6 +81,52 @@ func (s *Service) isOwnRevision(event couchdb.ChangeEvent) bool {
 		s.internalOwnRevs.Delete(event.ID)
 	}
 	return match
+}
+
+// mtimeResolution is the step, in milliseconds, in which modification times
+// are compared. LiveSync uses the same two seconds.
+const mtimeResolution = 2000
+
+// alignInternalMTime gives a hidden file the modification time of the document
+// it now holds, so a later local edit is recognisable as newer.
+func alignInternalMTime(absPath string, doc couchdb.MetaDoc) {
+	if doc.MTime <= 0 {
+		return
+	}
+	mtime := time.UnixMilli(doc.MTime)
+	_ = os.Chtimes(absPath, mtime, mtime)
+}
+
+// keepLocalInternal decides whether a remote i: document may replace or delete
+// an existing hidden file on a device that also uploads hidden files. It
+// reports true when the file must be left alone: it already holds the remote
+// content, or it was modified after the remote version (typically while obgo
+// was stopped or still pulling) and is uploaded instead. content is the remote
+// content, ignored when the document is a deletion.
+func (s *Service) keepLocalInternal(ctx context.Context, absPath string, doc couchdb.MetaDoc, content []byte) (bool, error) {
+	if !s.internalPushEnabled() || isInternalPushIgnored(doc.Path) {
+		return false, nil
+	}
+	info, err := os.Lstat(absPath)
+	if err != nil || !info.Mode().IsRegular() {
+		return false, nil
+	}
+	if !doc.IsDeleted() {
+		if local, err := os.ReadFile(absPath); err == nil && bytes.Equal(local, content) {
+			alignInternalMTime(absPath, doc)
+			return true, nil
+		}
+	}
+	if doc.MTime <= 0 || info.ModTime().UnixMilli()/mtimeResolution <= doc.MTime/mtimeResolution {
+		return false, nil
+	}
+	if err := s.pushInternalFile(ctx, absPath, doc.Path); err != nil && !errors.Is(err, errInternalUnchanged) {
+		return false, fmt.Errorf("upload newer local %q: %w", doc.Path, err)
+	}
+	if s.OnWatchEvent != nil {
+		s.OnWatchEvent(doc.Path, true)
+	}
+	return true, nil
 }
 
 func internalDocType(path string, content []byte) string {
@@ -248,8 +293,9 @@ func (s *Service) tombstoneInternal(ctx context.Context, relPath string) (bool, 
 		return false, nil
 	}
 	// A remove event can outlive the file's absence (atomic saves); only a file
-	// that is really gone may be deleted for every other device.
-	if _, err := os.Lstat(filepath.Join(s.dataDir, filepath.FromSlash(relPath))); err == nil {
+	// that is really gone may be deleted for every other device. Document IDs
+	// ignore case, so a sibling that differs only in case counts as present.
+	if _, err := os.Lstat(resolveCase(s.dataDir, relPath)); err == nil {
 		return false, nil
 	}
 	docID := s.internalDocID(relPath)
