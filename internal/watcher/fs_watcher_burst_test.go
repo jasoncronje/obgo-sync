@@ -118,3 +118,42 @@ func TestLocalWatcher_SuppressedChangeIsReportedAfterSuppression(t *testing.T) {
 		t.Fatalf("%d reports after the suppression window, want 1", reports)
 	}
 }
+
+// fsnotify's kqueue backend reports a removal on a watch that is already gone
+// as an event with an empty name followed by a Create for ".". Neither may
+// reach the callbacks: "." is the working directory of the process.
+func TestLocalWatcher_IgnoresEventsOutsideTheVault(t *testing.T) {
+	dir := t.TempDir()
+	fw, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fw.Close()
+
+	var changes, removes []string
+	lw := NewLocalWatcher(dir, NewSuppressSet(), func(path string, _ fsnotify.Op) {
+		changes = append(changes, path)
+	}, func(path string) {
+		removes = append(removes, path)
+	}, WithDebounce(time.Millisecond), WithSyncHidden(true))
+
+	for _, event := range []fsnotify.Event{
+		{Name: "", Op: fsnotify.Remove},
+		{Name: ".", Op: fsnotify.Create},
+		{Name: ".", Op: fsnotify.Write},
+		{Name: filepath.Dir(dir), Op: fsnotify.Create},
+		{Name: dir, Op: fsnotify.Create},
+	} {
+		lw.handleEvent(fw, event)
+	}
+	time.Sleep(5 * time.Millisecond)
+	lw.flushDueRemoves()
+	lw.flushDueChecks()
+
+	if len(changes) != 0 || len(removes) != 0 {
+		t.Fatalf("events outside the vault reached the callbacks: changes %q, removes %q", changes, removes)
+	}
+	if len(lw.watchedDirs) != 0 {
+		t.Fatalf("events outside the vault added watches: %v", lw.watchedDirs)
+	}
+}

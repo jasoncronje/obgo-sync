@@ -140,7 +140,7 @@ func (w *LocalWatcher) addDirRecursive(fw *fsnotify.Watcher, dir string) error {
 // case for which the kernel emits no per-file events. Hidden entries follow
 // the same opt-in policy as handleEvent.
 func (w *LocalWatcher) emitExistingFiles(dir string) {
-	if w.onChange == nil {
+	if w.onChange == nil || !w.inVault(dir) {
 		return
 	}
 	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
@@ -190,12 +190,24 @@ func (w *LocalWatcher) removeWatchDirRecursive(fw *fsnotify.Watcher, dir string)
 	}
 }
 
+// inVault reports whether path lies under the watched directory.
+func (w *LocalWatcher) inVault(path string) bool {
+	return path != "" && isPathInside(path, w.dir)
+}
+
 func isPathInside(path, dir string) bool {
 	rel, err := filepath.Rel(dir, path)
 	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func (w *LocalWatcher) handleEvent(fw *fsnotify.Watcher, event fsnotify.Event) {
+	// fsnotify's kqueue backend can report an event for a watch that is
+	// already gone, with an empty name, and then a Create for "." (the name
+	// cleaned). Acting on that walks the working directory of the process,
+	// which under launchd is the whole filesystem.
+	if !w.inVault(event.Name) {
+		return
+	}
 	if w.shouldSkipPath(event.Name) {
 		return
 	}
