@@ -69,3 +69,52 @@ func TestLocalWatcher_RemovalsSurviveSlowCallback(t *testing.T) {
 	cancel()
 	_ = errCh
 }
+
+// A change event inside the suppression window may be a real edit made right
+// after the app's own write. It is reported once the window has passed.
+func TestLocalWatcher_SuppressedChangeIsReportedAfterSuppression(t *testing.T) {
+	dir := t.TempDir()
+	suppress := NewSuppressSet()
+	file := filepath.Join(dir, "note.md")
+
+	var mu sync.Mutex
+	var reports int
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	lw := NewLocalWatcher(dir, suppress, func(path string, _ fsnotify.Op) {
+		if path == file {
+			mu.Lock()
+			reports++
+			mu.Unlock()
+		}
+	}, nil)
+	go func() { _ = lw.Run(ctx) }()
+	time.Sleep(100 * time.Millisecond)
+
+	suppress.Add(file)
+	if err := os.WriteFile(file, []byte("written by the app"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("edited right after"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(time.Second)
+	mu.Lock()
+	early := reports
+	mu.Unlock()
+	if early != 0 {
+		t.Fatalf("%d reports inside the suppression window", early)
+	}
+	if !waitForEvent(t, suppress.TTL()+3*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return reports == 1
+	}) {
+		mu.Lock()
+		defer mu.Unlock()
+		t.Fatalf("%d reports after the suppression window, want 1", reports)
+	}
+}

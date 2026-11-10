@@ -268,7 +268,7 @@ func (s *Service) applyRemoteDoc(ctx context.Context, doc couchdb.MetaDoc) error
 		}
 		return nil
 	}
-	s.alignNoteMTime(absPath, doc)
+	s.alignNoteMTime(absPath, doc, content)
 	return nil
 }
 

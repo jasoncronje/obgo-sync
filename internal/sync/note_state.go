@@ -3,6 +3,7 @@ package sync
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -108,6 +109,15 @@ func (s *Service) forgetNote(id string) {
 	s.notesMu.Unlock()
 }
 
+// noteIsLive reports whether the index holds a live document with this ID.
+// It is false while the index is not loaded.
+func (s *Service) noteIsLive(id string) bool {
+	s.notesMu.Lock()
+	defer s.notesMu.Unlock()
+	_, ok := s.notePaths[id]
+	return ok
+}
+
 // notesUnder returns the live notes whose path lies under prefix. The index is
 // seeded by pull; without one it is built once from a full listing, which on a
 // large vault takes minutes and used to be repeated for every removed folder.
@@ -134,34 +144,37 @@ func (s *Service) notesUnder(ctx context.Context, prefix string) ([]noteRef, err
 	return refs, nil
 }
 
-// markSynced records the modification time a file had while its content
-// matched the remote document, so a later change on disk can be told apart
-// from a file that was merely pulled.
-func (s *Service) markSynced(absPath string, mtime time.Time) {
+// syncedNote is what a note looked like on disk when it last matched its
+// document.
+type syncedNote struct {
+	mtime time.Time
+	sum   [sha256.Size]byte
+}
+
+// markSynced records a file's modification time and content while they match
+// the remote document, so a later change on disk can be told apart from a file
+// that was merely pulled, and a remote revision that only repeats that content
+// can be told apart from a remote edit.
+func (s *Service) markSynced(absPath string, mtime time.Time, content []byte) {
 	s.syncedMu.Lock()
-	if s.syncedMTimes == nil {
-		s.syncedMTimes = make(map[string]time.Time)
+	if s.synced == nil {
+		s.synced = make(map[string]syncedNote)
 	}
-	s.syncedMTimes[absPath] = mtime
+	s.synced[absPath] = syncedNote{mtime: mtime, sum: sha256.Sum256(content)}
 	s.syncedMu.Unlock()
 }
 
 func (s *Service) forgetSynced(absPath string) {
 	s.syncedMu.Lock()
-	delete(s.syncedMTimes, absPath)
+	delete(s.synced, absPath)
 	s.syncedMu.Unlock()
 }
 
-// changedSinceSync reports whether a file's modification time differs from
-// the one on record, and whether there is a record at all.
-func (s *Service) changedSinceSync(absPath string, info os.FileInfo) (changed, known bool) {
+func (s *Service) syncedRecord(absPath string) (syncedNote, bool) {
 	s.syncedMu.Lock()
 	defer s.syncedMu.Unlock()
-	mtime, ok := s.syncedMTimes[absPath]
-	if !ok {
-		return false, false
-	}
-	return !info.ModTime().Equal(mtime), true
+	note, ok := s.synced[absPath]
+	return note, ok
 }
 
 // alignNoteMTime gives a pulled note the modification time of its document
@@ -169,7 +182,7 @@ func (s *Service) changedSinceSync(absPath string, info os.FileInfo) (changed, k
 //
 // A file whose time already matches to the millisecond is left untouched, so
 // an editor or agent that has it open does not see it change for no reason.
-func (s *Service) alignNoteMTime(absPath string, doc couchdb.MetaDoc) {
+func (s *Service) alignNoteMTime(absPath string, doc couchdb.MetaDoc, content []byte) {
 	info, err := os.Lstat(absPath)
 	if err != nil {
 		return
@@ -182,39 +195,56 @@ func (s *Service) alignNoteMTime(absPath string, doc couchdb.MetaDoc) {
 			}
 		}
 	}
-	s.markSynced(absPath, info.ModTime())
+	s.markSynced(absPath, info.ModTime(), content)
 }
 
 // keepLocalNote decides whether a remote note may replace or delete an
-// existing local file. It reports true when the file must be left alone:
+// existing local file. It reports true when the file must be left alone.
 //
-//   - it already holds the remote content;
-//   - it changed on disk since it was last in sync and is newer than the
-//     remote version, in which case it is uploaded instead;
-//   - nothing is on record for it (obgo was not running when it last changed)
-//     and it is newer than the remote version, with the same result.
+// The file is compared with what it held when it last matched its document:
 //
-// A remote deletion only yields to a file that is known to have changed since
-// it was last in sync, because tombstones carry no reliable time. content is
-// the remote content, ignored for a deletion.
+//   - it already holds the remote content: nothing to do;
+//   - it is unchanged since then: the remote version is applied;
+//   - it changed, and the remote revision only repeats the content it was last
+//     in sync with (another client saved the note again without editing it):
+//     the file is kept and uploaded, whatever the times say;
+//   - both sides changed, or nothing is on record because obgo was not
+//     running: the newer modification time wins, and a newer file is uploaded.
+//
+// A remote deletion only yields to a file on record as changed, because
+// tombstones carry no reliable time. content is the remote content, ignored
+// for a deletion.
 func (s *Service) keepLocalNote(ctx context.Context, absPath string, doc couchdb.MetaDoc, content []byte) (bool, error) {
 	info, err := os.Lstat(absPath)
 	if err != nil || !info.Mode().IsRegular() {
 		return false, nil
 	}
-	changed, known := s.changedSinceSync(absPath, info)
-	if doc.IsDeleted() {
-		if !known || !changed {
+	local, err := os.ReadFile(absPath)
+	if err != nil {
+		return false, nil
+	}
+	deleted := doc.IsDeleted()
+	if !deleted && bytes.Equal(local, content) {
+		// A time later than the document's would make this file look edited
+		// at the next start. An earlier one is harmless and is left alone.
+		if info.ModTime().UnixMilli() > doc.MTime {
+			s.alignNoteMTime(absPath, doc, content)
+		} else {
+			s.markSynced(absPath, info.ModTime(), content)
+		}
+		return true, nil
+	}
+	base, known := s.syncedRecord(absPath)
+	switch {
+	case known && sha256.Sum256(local) == base.sum:
+		return false, nil
+	case deleted:
+		if !known {
 			return false, nil
 		}
-	} else {
-		if local, rerr := os.ReadFile(absPath); rerr == nil && bytes.Equal(local, content) {
-			s.alignNoteMTime(absPath, doc)
-			return true, nil
-		}
-		if known && !changed {
-			return false, nil
-		}
+	case known && sha256.Sum256(content) == base.sum:
+		// Only the local side changed.
+	default:
 		if doc.MTime <= 0 || info.ModTime().UnixMilli() <= doc.MTime {
 			return false, nil
 		}

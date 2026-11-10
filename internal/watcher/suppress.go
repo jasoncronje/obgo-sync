@@ -22,6 +22,11 @@ func NewSuppressSet() *SuppressSet {
 	}
 }
 
+// TTL returns how long an added path stays suppressed.
+func (s *SuppressSet) TTL() time.Duration {
+	return s.ttl
+}
+
 // Add marks path as written by the app. Expires after ttl.
 func (s *SuppressSet) Add(path string) {
 	s.mu.Lock()

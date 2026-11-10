@@ -68,14 +68,26 @@ Without this, a device that fell behind on file events kept re-uploading the
 notes it had just pulled, and every other device echoed them in turn.
 
 A pull does not replace a note that changed locally after the remote version
-was written. obgo records the modification time each note had when it last
-matched its document. A note that changed since then and is newer than the
-incoming revision is kept and uploaded; so is a note edited while obgo was
-stopped, which has no record and is compared by modification time alone. A
-remote deletion removes a note unless it is on record as changed since it was
+was written. obgo records the content and modification time each note had when
+it last matched its document, and compares an incoming revision with that:
+
+- a file that already holds the remote content is left alone;
+- a file unchanged since it was last in sync takes the remote version;
+- a file that changed, while the remote revision only repeats the content it
+  was last in sync with, is kept and uploaded whatever the times say. Another
+  client saving a note again without editing it produces such a revision;
+  Templater's "Trigger Templater on new file creation" does it to every note
+  LiveSync creates;
+- when both sides changed, or nothing is on record because obgo was not
+  running, the newer modification time wins and a newer file is uploaded.
+
+A remote deletion removes a note unless it is on record as changed since it was
 last in sync. Pulled notes take the modification time of their document, so the
 first start after an upgrade changes the modification time of most notes once.
-A revision older than the one obgo last wrote to a document is ignored.
+A revision older than the one obgo last wrote to a document is ignored. A
+change event that falls inside the two-second suppression after obgo's own
+write is looked at again when the suppression ends, so an edit made right
+after a pull is still uploaded.
 
 Local removals are never dropped, however many arrive at once. A removed or
 moved folder is resolved against an in-memory index of note paths, which the

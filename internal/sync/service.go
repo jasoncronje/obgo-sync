@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strings"
 	stdsync "sync"
-	"time"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/jookos/obgo-sync/internal/couchdb"
@@ -37,10 +36,10 @@ type Service struct {
 	notesMu            stdsync.Mutex
 	notePaths          map[string]string // live note document ID -> path; nil until loaded
 	syncedMu           stdsync.Mutex
-	syncedMTimes       map[string]time.Time // absolute path -> mtime while last in sync
-	internalPaths      stdsync.Map          // document ID -> local path, for lean watch tombstones
-	internalOwnerPaths stdsync.Map          // case-folded local path -> ownership
-	internalOwnerIDs   stdsync.Map          // competing ordinary document ID -> ownership
+	synced             map[string]syncedNote // absolute path -> the note while last in sync
+	internalPaths      stdsync.Map           // document ID -> local path, for lean watch tombstones
+	internalOwnerPaths stdsync.Map           // case-folded local path -> ownership
+	internalOwnerIDs   stdsync.Map           // competing ordinary document ID -> ownership
 	internalStateOnce  stdsync.Once
 	internalStateMu    stdsync.Mutex
 	internalStateErr   error
@@ -190,9 +189,11 @@ func (s *Service) tombstonePrefix(ctx context.Context, prefix string) {
 		doc := couchdb.MetaDoc{ID: ref.id, Path: ref.path}
 		// A note whose file is present (moved back, or recreated under the
 		// same name) is not deleted for every other device.
-		if _, err := os.Lstat(filepath.Join(s.dataDir, filepath.FromSlash(doc.Path))); err == nil {
+		absPath := filepath.Join(s.dataDir, filepath.FromSlash(doc.Path))
+		if _, err := os.Lstat(absPath); err == nil {
 			continue
 		}
+		s.forgetSynced(absPath)
 		owned, err := s.checkInternalOwner(ctx, doc.Path)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "watch: ownership check: %v\n", err)

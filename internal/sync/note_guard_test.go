@@ -151,6 +151,63 @@ func TestWatchKeepsNoteChangedAfterItsUpload(t *testing.T) {
 	}
 }
 
+// Another client can save a note again without editing it (Templater's
+// "trigger on new file creation" does this to every note LiveSync creates).
+// That revision carries a later time than a local edit made in between, and
+// must still not replace the edit.
+func TestWatchKeepsEditWhenRemoteRepeatsSyncedContent(t *testing.T) {
+	root := t.TempDir()
+	db := &internalEventClient{mockClient: newMockClient()}
+	rel := "notes/plan.md"
+	s, id, uploaded := pushedNote(t, db, db.mockClient, root, rel, "as uploaded")
+	editNote(t, root, rel, "edited seconds later", uploaded.Add(3*time.Second))
+
+	db.chunkDocs["h:same"] = couchdb.ChunkDoc{ID: "h:same", Data: "as uploaded"}
+	resaved := couchdb.MetaDoc{ID: id, Rev: "2-other", Type: "plain", Path: rel, MTime: uploaded.Add(10 * time.Second).UnixMilli(), Size: 11, Children: []string{"h:same"}}
+	watchRemote(t, s, db, couchdb.ChangeEvent{ID: id, Doc: &resaved})
+
+	if got := readNote(t, root, rel); got != "edited seconds later" {
+		t.Fatalf("a revision repeating the synced content replaced a local edit: %q", got)
+	}
+	if len(db.putMetaDocs) != 2 {
+		t.Fatalf("the local edit was not uploaded: %d writes", len(db.putMetaDocs))
+	}
+}
+
+// When both sides changed, the newer modification time wins.
+func TestWatchNewerRemoteEditReplacesOlderLocalEdit(t *testing.T) {
+	root := t.TempDir()
+	db := &internalEventClient{mockClient: newMockClient()}
+	rel := "notes/plan.md"
+	s, id, uploaded := pushedNote(t, db, db.mockClient, root, rel, "as uploaded")
+	editNote(t, root, rel, "local edit", uploaded.Add(3*time.Second))
+
+	db.chunkDocs["h:theirs"] = couchdb.ChunkDoc{ID: "h:theirs", Data: "remote edit"}
+	theirs := couchdb.MetaDoc{ID: id, Rev: "2-other", Type: "plain", Path: rel, MTime: uploaded.Add(10 * time.Second).UnixMilli(), Size: 11, Children: []string{"h:theirs"}}
+	watchRemote(t, s, db, couchdb.ChangeEvent{ID: id, Doc: &theirs})
+
+	if got := readNote(t, root, rel); got != "remote edit" {
+		t.Fatalf("a newer remote edit did not replace an older local edit: %q", got)
+	}
+}
+
+// A local file that was only touched takes the remote version, even an older one.
+func TestWatchAppliesRemoteNoteOverTouchedFile(t *testing.T) {
+	root := t.TempDir()
+	db := &internalEventClient{mockClient: newMockClient()}
+	rel := "notes/plan.md"
+	s, id, uploaded := pushedNote(t, db, db.mockClient, root, rel, "current")
+	editNote(t, root, rel, "current", uploaded.Add(time.Hour))
+
+	db.chunkDocs["h:old"] = couchdb.ChunkDoc{ID: "h:old", Data: "restored"}
+	restored := couchdb.MetaDoc{ID: id, Rev: "2-def", Type: "plain", Path: rel, MTime: 1000, Size: 8, Children: []string{"h:old"}}
+	watchRemote(t, s, db, couchdb.ChangeEvent{ID: id, Doc: &restored})
+
+	if got := readNote(t, root, rel); got != "restored" {
+		t.Fatalf("remote revision was not applied to a file that was only touched: %q", got)
+	}
+}
+
 // A file that has not changed since it was last in sync takes the remote
 // version whatever the times say, for example a note restored from a backup
 // on another device.

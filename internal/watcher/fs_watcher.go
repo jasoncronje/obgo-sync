@@ -42,7 +42,12 @@ type LocalWatcher struct {
 	// Only the Run goroutine touches it, so however many removals arrive while
 	// a slow callback runs, none is dropped.
 	pendingRemoves map[string]time.Time
-	watchedDirs    map[string]struct{}
+	// pendingChecks holds each path whose change event was suppressed, with
+	// the time its suppression ends. The event may have been the app's own
+	// write or a real edit made right after it, so the path is reported once
+	// more then and the callback decides.
+	pendingChecks map[string]time.Time
+	watchedDirs   map[string]struct{}
 }
 
 // NewLocalWatcher creates a new LocalWatcher.
@@ -55,6 +60,7 @@ func NewLocalWatcher(dir string, suppress *SuppressSet, onChange func(string, fs
 		debounceDur:    defaultDebounceDur,
 		rescanInterval: defaultRescanInterval,
 		pendingRemoves: make(map[string]time.Time),
+		pendingChecks:  make(map[string]time.Time),
 		watchedDirs:    make(map[string]struct{}),
 	}
 	for _, o := range opts {
@@ -104,6 +110,7 @@ func (w *LocalWatcher) Run(ctx context.Context) error {
 			}
 		case <-removeTicker.C:
 			w.flushDueRemoves()
+			w.flushDueChecks()
 		case err, ok := <-fw.Errors:
 			if !ok {
 				return nil
@@ -147,7 +154,11 @@ func (w *LocalWatcher) emitExistingFiles(dir string) {
 			}
 			return nil
 		}
-		if w.shouldSkipPath(path) || w.suppress.IsSuppressed(path) {
+		if w.shouldSkipPath(path) {
+			return nil
+		}
+		if w.suppress.IsSuppressed(path) {
+			w.checkLater(path)
 			return nil
 		}
 		w.cancelPendingRemove(path)
@@ -205,6 +216,7 @@ func (w *LocalWatcher) handleEvent(fw *fsnotify.Watcher, event fsnotify.Event) {
 	case event.Has(fsnotify.Write):
 		w.cancelPendingRemove(event.Name)
 		if w.suppress.IsSuppressed(event.Name) {
+			w.checkLater(event.Name)
 			return
 		}
 		if w.onChange != nil {
@@ -250,6 +262,41 @@ func (w *LocalWatcher) flushDueRemoves() {
 		delete(w.pendingRemoves, path)
 		if w.onRemove != nil && !w.suppress.IsSuppressed(path) {
 			w.onRemove(path)
+		}
+	}
+}
+
+// checkLater schedules one more change report for a path whose event was
+// suppressed, for just after its suppression ends.
+func (w *LocalWatcher) checkLater(path string) {
+	w.pendingChecks[path] = time.Now().Add(w.suppress.TTL() + w.removeCheckInterval())
+}
+
+// flushDueChecks reports the paths whose suppression has ended. A path that
+// was written by the app again in the meantime waits for that suppression.
+func (w *LocalWatcher) flushDueChecks() {
+	if len(w.pendingChecks) == 0 {
+		return
+	}
+	now := time.Now()
+	var due []string
+	for path, at := range w.pendingChecks {
+		if !now.Before(at) {
+			due = append(due, path)
+		}
+	}
+	sort.Strings(due)
+	for _, path := range due {
+		delete(w.pendingChecks, path)
+		if w.suppress.IsSuppressed(path) {
+			w.checkLater(path)
+			continue
+		}
+		if info, err := os.Lstat(path); err != nil || info.IsDir() {
+			continue
+		}
+		if w.onChange != nil {
+			w.onChange(path, fsnotify.Write)
 		}
 	}
 }

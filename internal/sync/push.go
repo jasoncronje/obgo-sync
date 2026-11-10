@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -277,8 +278,8 @@ func (s *Service) pushFile(ctx context.Context, absPath string) error {
 		return s.pushInternalFile(ctx, absPath, relPath)
 	}
 
-	// Taken before the read: if the file changes while it is being uploaded,
-	// the time on record no longer matches and the file counts as changed.
+	// Taken before the read, so the document never claims a later time than
+	// the content it describes.
 	before, err := os.Stat(absPath)
 	if err != nil {
 		return fmt.Errorf("read %q: %w", absPath, err)
@@ -293,6 +294,13 @@ func (s *Service) pushFile(ctx context.Context, absPath string) error {
 	}
 	if owned {
 		return fmt.Errorf("%w: %s", ErrReceiveOnly, relPath)
+	}
+
+	// A note that still holds what it was last in sync with, and whose
+	// document is still live, needs no request at all.
+	docID := s.encodeDocID(relPath)
+	if base, ok := s.syncedRecord(absPath); ok && s.noteIsLive(docID) && sha256.Sum256(content) == base.sum {
+		return errUnchanged
 	}
 
 	// Determine doc type: plain (text) or newnote (binary).
@@ -317,13 +325,12 @@ func (s *Service) pushFile(ctx context.Context, absPath string) error {
 	size := int64(len(content))
 
 	// Fetch existing doc for rev and original ctime.
-	docID := s.encodeDocID(relPath)
 	existing, err := s.db.GetMeta(ctx, docID)
 	var rev string
 	var ctime int64 = mtime
 	if err == nil {
 		if s.holdsContent(ctx, *existing, content, chunkIDs) {
-			s.markSynced(absPath, before.ModTime())
+			s.markSynced(absPath, before.ModTime(), content)
 			s.rememberNote(docID, relPath)
 			return errUnchanged
 		}
@@ -364,7 +371,7 @@ func (s *Service) pushFile(ctx context.Context, absPath string) error {
 	if _, err := s.putOwn(ctx, meta); err != nil {
 		return fmt.Errorf("put meta %q: %w", relPath, err)
 	}
-	s.markSynced(absPath, before.ModTime())
+	s.markSynced(absPath, before.ModTime(), content)
 	s.rememberNote(docID, relPath)
 	return nil
 }
