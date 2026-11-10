@@ -58,6 +58,15 @@ its startup pull) is kept and uploaded, and only an older file is replaced or
 deleted. Modification times are compared in two-second steps, as LiveSync does,
 and pulled hidden files take the modification time of their document.
 
+Only dot-prefixed entries at the vault root are uploaded this way, as in
+LiveSync. A hidden name inside an ordinary folder, such as an exporter's
+`.note.md.7.tmp` or a `.keep`, is neither uploaded nor tombstoned.
+
+In watch mode a note whose content already matches its remote document is not
+uploaded again, and a revision obgo wrote itself is not applied back to disk.
+Without this, a device that fell behind on file events kept re-uploading the
+notes it had just pulled, and every other device echoed them in turn.
+
 Ownership is persisted in `.obgo_internal_paths` so hashed deletions work across
 restarts. Failed remote events (including conflicts, unavailable chunks and
 unsupported embedded `eden` chunks) are retained with their error in

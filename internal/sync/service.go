@@ -31,7 +31,7 @@ type Service struct {
 	obfuscationMode    string // "auto" | "on" | "off"; set by SetObfuscationMode
 	syncHidden         bool
 	internalPush       bool        // upload hidden paths as LiveSync i: documents
-	internalOwnRevs    stdsync.Map // i: document ID -> revision this process wrote last
+	ownRevs            stdsync.Map // document ID -> revision this process wrote last
 	internalPaths      stdsync.Map // document ID -> local path, for lean watch tombstones
 	internalOwnerPaths stdsync.Map // case-folded local path -> ownership
 	internalOwnerIDs   stdsync.Map // competing ordinary document ID -> ownership
@@ -255,6 +255,11 @@ func (s *Service) Watch(ctx context.Context, watchLocal, watchRemote bool) error
 		if !isFile {
 			return nil
 		}
+		// A revision this process uploaded needs no applying, and writing it
+		// back could replace a note that was edited again in the meantime.
+		if s.isOwnRevision(event) {
+			return nil
+		}
 
 		// Resolve path: prefer the doc body field, decrypt if obfuscated.
 		// Also restore Children and other metadata from the encrypted blob —
@@ -335,7 +340,7 @@ func (s *Service) Watch(ctx context.Context, watchLocal, watchRemote bool) error
 
 	localOnChange := func(path string, op fsnotify.Op) {
 		if err := s.pushFile(ctx, path); err != nil {
-			if errors.Is(err, errInternalUnchanged) {
+			if errors.Is(err, errUnchanged) {
 				return
 			}
 			fmt.Fprintf(os.Stderr, "watch: push %q: %v\n", path, err)

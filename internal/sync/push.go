@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"bytes"
 	"context"
 	cryptorand "crypto/rand"
 	"encoding/base64"
@@ -9,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -58,7 +60,7 @@ func (s *Service) Push(ctx context.Context, filter string) error {
 				return nil
 			}
 			if err := s.pushInternalFile(ctx, absPath, filter); err != nil {
-				if errors.Is(err, errInternalUnchanged) {
+				if errors.Is(err, errUnchanged) {
 					return nil
 				}
 				return err
@@ -100,6 +102,9 @@ func (s *Service) Push(ctx context.Context, filter string) error {
 			return nil
 		}
 		if err := s.pushFile(ctx, absPath); err != nil {
+			if errors.Is(err, errUnchanged) {
+				return nil
+			}
 			return err
 		}
 		if s.OnPushFile != nil {
@@ -140,7 +145,10 @@ func (s *Service) Push(ctx context.Context, filter string) error {
 			return nil
 		}
 		if err := s.pushFile(ctx, path); err != nil {
-			if errors.Is(err, errInternalUnchanged) {
+			if errors.Is(err, errUnchanged) {
+				// Still present locally: keep it out of the reconcile below,
+				// which tombstones every remote note that was not seen here.
+				pushedPaths[relPath] = struct{}{}
 				return nil
 			}
 			return err
@@ -297,11 +305,6 @@ func (s *Service) pushFile(ctx context.Context, absPath string) error {
 		return err
 	}
 
-	// Upload chunks.
-	if err := s.db.BulkDocs(ctx, chunkDocs); err != nil {
-		return fmt.Errorf("upload chunks for %q: %w", relPath, err)
-	}
-
 	// Stat the file for timestamps.
 	info, err := os.Stat(absPath)
 	if err != nil {
@@ -315,12 +318,20 @@ func (s *Service) pushFile(ctx context.Context, absPath string) error {
 	var rev string
 	var ctime int64 = mtime
 	if err == nil {
+		if s.holdsContent(ctx, *existing, content, chunkIDs) {
+			return errUnchanged
+		}
 		rev = existing.Rev
 		if existing.CTime > 0 {
 			ctime = existing.CTime
 		}
 	} else if !errors.Is(err, couchdb.ErrNotFound) {
 		return fmt.Errorf("get existing meta for %q: %w", relPath, err)
+	}
+
+	// Upload chunks.
+	if err := s.db.BulkDocs(ctx, chunkDocs); err != nil {
+		return fmt.Errorf("upload chunks for %q: %w", relPath, err)
 	}
 
 	// Build path field: encrypted blob for obfuscated vaults, plain path otherwise.
@@ -344,8 +355,33 @@ func (s *Service) pushFile(ctx context.Context, absPath string) error {
 		Eden:      map[string]interface{}{},
 		Encrypted: s.crypto.Enabled(),
 	}
-	if _, err := s.db.PutMeta(ctx, meta); err != nil {
+	newRev, err := s.db.PutMeta(ctx, meta)
+	if err != nil {
 		return fmt.Errorf("put meta %q: %w", relPath, err)
 	}
+	s.noteOwnRevision(docID, newRev)
 	return nil
+}
+
+// holdsContent reports whether a remote note already stores exactly this
+// content, so uploading it again would only add a revision. A pulled note
+// raises a write event of its own; once the watcher runs behind, that event
+// outlives the echo suppression and the note used to be uploaded straight
+// back, which the other devices then pulled and echoed in turn.
+func (s *Service) holdsContent(ctx context.Context, doc couchdb.MetaDoc, content []byte, chunkIDs []string) bool {
+	if doc.IsDeleted() || len(doc.Conflicts) > 0 || len(doc.Eden) > 0 {
+		return false
+	}
+	if err := s.decodeMetaBlob(&doc); err != nil {
+		return false
+	}
+	if doc.Size != int64(len(content)) {
+		return false
+	}
+	if slices.Equal(doc.Children, chunkIDs) {
+		return true
+	}
+	// Another client may have split the same content into different chunks.
+	remote, err := s.readRemoteContent(ctx, doc)
+	return err == nil && bytes.Equal(remote, content)
 }

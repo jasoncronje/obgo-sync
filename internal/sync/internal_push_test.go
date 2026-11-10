@@ -364,3 +364,21 @@ func TestPushInternalDisabledStaysReceiveOnly(t *testing.T) {
 		t.Fatal("internal push ran without OBGO_INTERNAL_PUSH")
 	}
 }
+
+func TestPushInternalIgnoresHiddenNamesInOrdinaryFolders(t *testing.T) {
+	root := t.TempDir()
+	db := newMockClient()
+	// A live document for a temp file that has since been renamed away.
+	db.metaDocs = []couchdb.MetaDoc{{ID: "i:f:tmp", Rev: "1-abc", Path: "i:notes/.gone.md.7.tmp", Type: "plain", Size: 1, Children: []string{"h:x"}}}
+	writeHidden(t, root, "notes/.draft.md.7.tmp", "half written")
+	writeHidden(t, root, "notes/sub/.keep", "")
+	s := newInternalPushService(db, crypto.New(""), root)
+	for _, target := range []string{"notes/.draft.md.7.tmp", "notes/.gone.md.7.tmp", "notes/"} {
+		if err := s.Push(context.Background(), target); err != nil {
+			t.Fatalf("push %q: %v", target, err)
+		}
+	}
+	if db.putMetaCalled || db.bulkDocsCalled {
+		t.Fatal("hidden name inside an ordinary folder produced remote writes")
+	}
+}

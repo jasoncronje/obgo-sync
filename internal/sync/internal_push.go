@@ -15,9 +15,9 @@ import (
 	"github.com/jookos/obgo-sync/lib/livesync"
 )
 
-// errInternalUnchanged reports that a hidden file already matches its i:
-// document, so nothing was uploaded. Callers treat it as a silent no-op.
-var errInternalUnchanged = errors.New("internal file unchanged")
+// errUnchanged reports that a file already matches its remote document, so
+// nothing was uploaded. Callers treat it as a silent no-op.
+var errUnchanged = errors.New("file unchanged")
 
 // plainTextExtensions mirrors LiveSync's isPlainText: hidden files with these
 // extensions are stored as "plain" documents, everything else as "newnote".
@@ -48,7 +48,14 @@ func isHiddenRelPath(path string) bool {
 // LiveSync never applies these paths, so uploading them is wasted work, and
 // its own plugin folder holds per-device settings that must not travel.
 func isInternalPushIgnored(relPath string) bool {
-	for _, part := range splitPathParts(relPath) {
+	parts := splitPathParts(relPath)
+	// LiveSync only scans dot-prefixed entries at the vault root. A hidden name
+	// inside an ordinary folder (an exporter's temp file, a .keep) never reaches
+	// other devices through it, so it is not uploaded or tombstoned either.
+	if len(parts) > 0 && !isHiddenLocalName(parts[0]) {
+		return true
+	}
+	for _, part := range parts {
 		switch part {
 		case ".DS_Store", ".trash", "node_modules", "obsidian-livesync":
 			return true
@@ -57,19 +64,19 @@ func isInternalPushIgnored(relPath string) bool {
 	return shouldSkipLocalPath(relPath, "", true)
 }
 
-// noteOwnRevision records a revision this process just wrote, so the change
-// feed's report of it is not applied back over a file that may already have
-// been edited again.
+// noteOwnRevision records a revision this process just wrote, for notes and
+// hidden files alike, so the change feed's report of it is not applied back
+// over a file that may already have been edited again.
 func (s *Service) noteOwnRevision(docID, rev string) {
 	if rev != "" {
-		s.internalOwnRevs.Store(docID, rev)
+		s.ownRevs.Store(docID, rev)
 	}
 }
 
 // isOwnRevision reports whether a change event describes a revision this
 // process wrote itself.
 func (s *Service) isOwnRevision(event couchdb.ChangeEvent) bool {
-	own, ok := s.internalOwnRevs.Load(event.ID)
+	own, ok := s.ownRevs.Load(event.ID)
 	if !ok {
 		return false
 	}
@@ -78,7 +85,7 @@ func (s *Service) isOwnRevision(event couchdb.ChangeEvent) bool {
 		match = match || change.Rev == own.(string)
 	}
 	if match {
-		s.internalOwnRevs.Delete(event.ID)
+		s.ownRevs.Delete(event.ID)
 	}
 	return match
 }
@@ -120,7 +127,7 @@ func (s *Service) keepLocalInternal(ctx context.Context, absPath string, doc cou
 	if doc.MTime <= 0 || info.ModTime().UnixMilli()/mtimeResolution <= doc.MTime/mtimeResolution {
 		return false, nil
 	}
-	if err := s.pushInternalFile(ctx, absPath, doc.Path); err != nil && !errors.Is(err, errInternalUnchanged) {
+	if err := s.pushInternalFile(ctx, absPath, doc.Path); err != nil && !errors.Is(err, errUnchanged) {
 		return false, fmt.Errorf("upload newer local %q: %w", doc.Path, err)
 	}
 	if s.OnWatchEvent != nil {
@@ -200,19 +207,19 @@ func isMetaBlob(path string) bool {
 }
 
 // pushInternalFile uploads a hidden file as a LiveSync i: document. It returns
-// errInternalUnchanged when the remote document already holds this content,
+// errUnchanged when the remote document already holds this content,
 // which is what stops a pulled file from being echoed straight back.
 func (s *Service) pushInternalFile(ctx context.Context, absPath, relPath string) error {
 	if err := s.loadInternalState(); err != nil {
 		return err
 	}
 	if isInternalPushIgnored(relPath) {
-		return errInternalUnchanged
+		return errUnchanged
 	}
 	if err := validateInternalPath(s.dataDir, relPath); err != nil {
 		if errors.Is(err, errInternalSymlink) {
 			// Local aliases are never uploaded; their canonical files sync separately.
-			return errInternalUnchanged
+			return errUnchanged
 		}
 		return err
 	}
@@ -246,7 +253,7 @@ func (s *Service) pushInternalFile(ctx context.Context, absPath, relPath string)
 		// so it is rewritten even when the content matches.
 		if !isMetaBlob(existing.Path) && !current.IsDeleted() && current.Size == size && len(current.Eden) == 0 {
 			if remote, rerr := s.readRemoteContent(ctx, current); rerr == nil && bytes.Equal(remote, content) {
-				return errInternalUnchanged
+				return errUnchanged
 			}
 		}
 		rev = existing.Rev
