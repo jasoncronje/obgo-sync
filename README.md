@@ -49,9 +49,14 @@ Documents with unresolved conflicts are left for LiveSync.
 
 As LiveSync does, an `i:` document keeps a readable `path`, `mtime`, `size` and
 `children` even when path obfuscation is on; only its ID is hashed and its
-chunks encrypted. `pull` still writes the remote version over the local one, so
-a hidden file edited while obgo is stopped or still running its startup pull
-is replaced by the remote copy.
+chunks encrypted.
+
+With `OBGO_INTERNAL_PUSH=true`, `pull` no longer replaces a hidden file blindly.
+A file that already holds the remote content is left alone, a file modified
+after the remote version (for example while obgo was stopped or still running
+its startup pull) is kept and uploaded, and only an older file is replaced or
+deleted. Modification times are compared in two-second steps, as LiveSync does,
+and pulled hidden files take the modification time of their document.
 
 Ownership is persisted in `.obgo_internal_paths` so hashed deletions work across
 restarts. Failed remote events (including conflicts, unavailable chunks and
