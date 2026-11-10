@@ -39,6 +39,7 @@ func (s *Service) Pull(ctx context.Context, filter string) error {
 	}
 	s.detectObfuscation(docs)
 	s.decryptDocPaths(docs)
+	s.seedNotePaths(docs)
 	if err := s.rememberInternal(docs); err != nil {
 		return fmt.Errorf("persist internal ownership: %w", err)
 	}
@@ -208,19 +209,22 @@ func (s *Service) applyRemoteDoc(ctx context.Context, doc couchdb.MetaDoc) error
 		// resolveCase handles case mismatches between the lowercase doc ID
 		// and the original-cased path stored on a case-sensitive filesystem.
 		absPath := resolveCase(s.dataDir, path)
+		keepLocal := s.keepLocalNote
 		if strings.HasPrefix(doc.ID, "i:") {
-			keep, err := s.keepLocalInternal(ctx, absPath, doc, nil)
-			if err != nil {
-				return err
-			}
-			if keep {
-				return nil
-			}
+			keepLocal = s.keepLocalInternal
+		}
+		keep, err := keepLocal(ctx, absPath, doc, nil)
+		if err != nil {
+			return err
+		}
+		if keep {
+			return nil
 		}
 		s.suppress.Add(absPath)
 		if err := os.Remove(absPath); err != nil && !os.IsNotExist(err) {
 			return err
 		}
+		s.forgetSynced(absPath)
 		if s.OnDeleteFile != nil {
 			s.OnDeleteFile(path)
 		}
@@ -240,14 +244,16 @@ func (s *Service) applyRemoteDoc(ctx context.Context, doc couchdb.MetaDoc) error
 	// Write to disk.
 	absPath := filepath.Join(s.dataDir, filepath.FromSlash(doc.Path))
 	internal := strings.HasPrefix(doc.ID, "i:")
+	keepLocal := s.keepLocalNote
 	if internal {
-		keep, err := s.keepLocalInternal(ctx, absPath, doc, content)
-		if err != nil {
-			return err
-		}
-		if keep {
-			return nil
-		}
+		keepLocal = s.keepLocalInternal
+	}
+	keep, err := keepLocal(ctx, absPath, doc, content)
+	if err != nil {
+		return err
+	}
+	if keep {
+		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
@@ -256,9 +262,13 @@ func (s *Service) applyRemoteDoc(ctx context.Context, doc couchdb.MetaDoc) error
 	if err := os.WriteFile(absPath, content, 0o644); err != nil {
 		return err
 	}
-	if internal && s.internalPushEnabled() {
-		alignInternalMTime(absPath, doc)
+	if internal {
+		if s.internalPushEnabled() {
+			alignInternalMTime(absPath, doc)
+		}
+		return nil
 	}
+	s.alignNoteMTime(absPath, doc)
 	return nil
 }
 

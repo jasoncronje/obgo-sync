@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	stdsync "sync"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/jookos/obgo-sync/internal/couchdb"
@@ -30,11 +31,16 @@ type Service struct {
 	obfuscated         bool   // true when the remote vault uses path obfuscation
 	obfuscationMode    string // "auto" | "on" | "off"; set by SetObfuscationMode
 	syncHidden         bool
-	internalPush       bool        // upload hidden paths as LiveSync i: documents
-	ownRevs            stdsync.Map // document ID -> revision this process wrote last
-	internalPaths      stdsync.Map // document ID -> local path, for lean watch tombstones
-	internalOwnerPaths stdsync.Map // case-folded local path -> ownership
-	internalOwnerIDs   stdsync.Map // competing ordinary document ID -> ownership
+	internalPush       bool // upload hidden paths as LiveSync i: documents
+	ownMu              stdsync.Mutex
+	ownRevs            map[string]string // document ID -> revision this process wrote last
+	notesMu            stdsync.Mutex
+	notePaths          map[string]string // live note document ID -> path; nil until loaded
+	syncedMu           stdsync.Mutex
+	syncedMTimes       map[string]time.Time // absolute path -> mtime while last in sync
+	internalPaths      stdsync.Map          // document ID -> local path, for lean watch tombstones
+	internalOwnerPaths stdsync.Map          // case-folded local path -> ownership
+	internalOwnerIDs   stdsync.Map          // competing ordinary document ID -> ownership
 	internalStateOnce  stdsync.Once
 	internalStateMu    stdsync.Mutex
 	internalStateErr   error
@@ -171,15 +177,20 @@ func (s *Service) List(ctx context.Context, prefix string) ([]couchdb.MetaDoc, e
 // (which must end in "/") as app-level deleted. Used when a directory
 // disappears locally: the kernel reports one event for the directory and none
 // for its children, so the children have to be resolved from the remote side.
+//
+// The documents come from the in-memory path index, so a removed folder costs
+// two requests per note beneath it instead of a listing of the whole database.
 func (s *Service) tombstonePrefix(ctx context.Context, prefix string) {
-	docs, err := s.db.AllMetaDocs(ctx)
+	docs, err := s.notesUnder(ctx, prefix)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "watch: tombstone %q: list: %v\n", prefix, err)
 		return
 	}
-	s.decryptDocPaths(docs)
-	for _, doc := range docs {
-		if doc.IsDeleted() || !strings.HasPrefix(doc.Path, prefix) {
+	for _, ref := range docs {
+		doc := couchdb.MetaDoc{ID: ref.id, Path: ref.path}
+		// A note whose file is present (moved back, or recreated under the
+		// same name) is not deleted for every other device.
+		if _, err := os.Lstat(filepath.Join(s.dataDir, filepath.FromSlash(doc.Path))); err == nil {
 			continue
 		}
 		owned, err := s.checkInternalOwner(ctx, doc.Path)
@@ -195,16 +206,25 @@ func (s *Service) tombstonePrefix(ctx context.Context, prefix string) {
 		// this copy back would leak the path on an obfuscated vault.
 		raw, gerr := s.db.GetMeta(ctx, doc.ID)
 		if gerr != nil {
+			if errors.Is(gerr, couchdb.ErrNotFound) {
+				s.forgetNote(doc.ID)
+				continue
+			}
 			fmt.Fprintf(os.Stderr, "watch: tombstone %q: fetch: %v\n", doc.Path, gerr)
+			continue
+		}
+		if raw.IsDeleted() {
+			s.forgetNote(doc.ID)
 			continue
 		}
 		raw.Deleted = false
 		raw.DeletedApp = true
 		raw.Children = nil
-		if _, err := s.db.PutMeta(ctx, raw); err != nil {
+		if _, err := s.putOwn(ctx, raw); err != nil {
 			fmt.Fprintf(os.Stderr, "watch: tombstone %q: %v\n", doc.Path, err)
 			continue
 		}
+		s.forgetNote(doc.ID)
 		if s.OnTombstone != nil {
 			s.OnTombstone(doc.Path)
 		}
@@ -260,6 +280,9 @@ func (s *Service) Watch(ctx context.Context, watchLocal, watchRemote bool) error
 		if s.isOwnRevision(event) {
 			return nil
 		}
+		if event.Deleted || (event.Doc != nil && event.Doc.IsDeleted()) {
+			s.forgetNote(event.ID)
+		}
 
 		// Resolve path: prefer the doc body field, decrypt if obfuscated.
 		// Also restore Children and other metadata from the encrypted blob —
@@ -312,10 +335,18 @@ func (s *Service) Watch(ctx context.Context, watchLocal, watchRemote bool) error
 
 		if event.Deleted {
 			absPath := resolveCase(s.dataDir, path)
+			keep, err := s.keepLocalNote(ctx, absPath, couchdb.MetaDoc{ID: event.ID, Path: path, Deleted: true}, nil)
+			if err != nil {
+				return err
+			}
+			if keep {
+				return nil
+			}
 			s.suppress.Add(absPath)
 			if err := os.Remove(absPath); err != nil && !os.IsNotExist(err) {
 				return err
 			}
+			s.forgetSynced(absPath)
 			if s.OnDeleteFile != nil {
 				s.OnDeleteFile(path)
 			}
@@ -323,6 +354,9 @@ func (s *Service) Watch(ctx context.Context, watchLocal, watchRemote bool) error
 		}
 		if event.Doc != nil {
 			event.Doc.Path = path
+			if !event.Doc.IsDeleted() {
+				s.rememberNote(event.ID, path)
+			}
 			resolved, rerr := s.resolveConflicts(ctx, *event.Doc)
 			if rerr != nil {
 				fmt.Fprintf(os.Stderr, "watch: resolve conflicts %q: %v\n", path, rerr)
@@ -340,7 +374,9 @@ func (s *Service) Watch(ctx context.Context, watchLocal, watchRemote bool) error
 
 	localOnChange := func(path string, op fsnotify.Op) {
 		if err := s.pushFile(ctx, path); err != nil {
-			if errors.Is(err, errUnchanged) {
+			// A file that is gone again (moved or deleted before its event was
+			// handled) is the remove event's business.
+			if errors.Is(err, errUnchanged) || errors.Is(err, os.ErrNotExist) {
 				return
 			}
 			fmt.Fprintf(os.Stderr, "watch: push %q: %v\n", path, err)
@@ -363,6 +399,12 @@ func (s *Service) Watch(ctx context.Context, watchLocal, watchRemote bool) error
 			if err := s.tombstoneInternalTree(ctx, relPath); err != nil {
 				fmt.Fprintf(os.Stderr, "watch: delete %q: %v\n", relPath, err)
 			}
+			return
+		}
+		// A remove event can outlive the file's absence: an atomic save, or a
+		// rename that only changes case. A file that is present is uploaded by
+		// its own event and must not be deleted for every other device.
+		if info, err := os.Lstat(path); err == nil && !info.IsDir() {
 			return
 		}
 		owned, err := s.checkInternalOwner(ctx, relPath)
@@ -393,13 +435,19 @@ func (s *Service) Watch(ctx context.Context, watchLocal, watchRemote bool) error
 			s.tombstonePrefix(ctx, relPath+"/")
 			return
 		}
+		s.forgetSynced(path)
+		if existing.IsDeleted() {
+			s.forgetNote(docID)
+			return
+		}
 		existing.Deleted = false
 		existing.DeletedApp = true
 		existing.Children = nil
-		if _, err := s.db.PutMeta(ctx, existing); err != nil {
+		if _, err := s.putOwn(ctx, existing); err != nil {
 			fmt.Fprintf(os.Stderr, "watch: delete %q: %v\n", relPath, err)
 			return
 		}
+		s.forgetNote(docID)
 		if s.OnTombstone != nil {
 			s.OnTombstone(relPath)
 		}

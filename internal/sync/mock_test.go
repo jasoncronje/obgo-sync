@@ -14,6 +14,8 @@ type mockClient struct {
 	bulkDocsCalled bool
 	putMetaCalled  bool
 	putMetaDocs    []*couchdb.MetaDoc
+	putMetaRev     string // revision PutMeta reports; "1-abc" when empty
+	allMetaCalls   int    // full listings requested
 	bulkDocsArg    []interface{}
 }
 
@@ -25,6 +27,7 @@ func newMockClient() *mockClient {
 }
 
 func (m *mockClient) AllMetaDocs(ctx context.Context) ([]couchdb.MetaDoc, error) {
+	m.allMetaCalls++
 	// Hand out copies. The real client decodes fresh structs on every request,
 	// and callers mutate what they get back (Push decrypts paths in place), so
 	// returning the fixture slice would let one call corrupt later ones.
@@ -46,6 +49,9 @@ func (m *mockClient) GetMeta(ctx context.Context, id string) (*couchdb.MetaDoc, 
 func (m *mockClient) PutMeta(ctx context.Context, doc *couchdb.MetaDoc) (string, error) {
 	m.putMetaCalled = true
 	m.putMetaDocs = append(m.putMetaDocs, doc)
+	if m.putMetaRev != "" {
+		return m.putMetaRev, nil
+	}
 	return "1-abc", nil
 }
 

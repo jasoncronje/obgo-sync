@@ -64,32 +64,6 @@ func isInternalPushIgnored(relPath string) bool {
 	return shouldSkipLocalPath(relPath, "", true)
 }
 
-// noteOwnRevision records a revision this process just wrote, for notes and
-// hidden files alike, so the change feed's report of it is not applied back
-// over a file that may already have been edited again.
-func (s *Service) noteOwnRevision(docID, rev string) {
-	if rev != "" {
-		s.ownRevs.Store(docID, rev)
-	}
-}
-
-// isOwnRevision reports whether a change event describes a revision this
-// process wrote itself.
-func (s *Service) isOwnRevision(event couchdb.ChangeEvent) bool {
-	own, ok := s.ownRevs.Load(event.ID)
-	if !ok {
-		return false
-	}
-	match := event.Doc != nil && event.Doc.Rev == own.(string)
-	for _, change := range event.Changes {
-		match = match || change.Rev == own.(string)
-	}
-	if match {
-		s.ownRevs.Delete(event.ID)
-	}
-	return match
-}
-
 // mtimeResolution is the step, in milliseconds, in which modification times
 // are compared. LiveSync uses the same two seconds.
 const mtimeResolution = 2000
@@ -281,11 +255,9 @@ func (s *Service) pushInternalFile(ctx context.Context, absPath, relPath string)
 		Children: chunkIDs,
 		Eden:     map[string]interface{}{},
 	}
-	newRev, err := s.db.PutMeta(ctx, meta)
-	if err != nil {
+	if _, err := s.putOwn(ctx, meta); err != nil {
 		return fmt.Errorf("put meta %q: %w", relPath, err)
 	}
-	s.noteOwnRevision(docID, newRev)
 	return s.rememberInternal([]couchdb.MetaDoc{{ID: docID, Path: "i:" + relPath}})
 }
 
@@ -332,11 +304,9 @@ func (s *Service) tombstoneInternal(ctx context.Context, relPath string) (bool, 
 	existing.Eden = map[string]interface{}{}
 	existing.Size = 0
 	existing.MTime = time.Now().UnixMilli()
-	newRev, err := s.db.PutMeta(ctx, existing)
-	if err != nil {
+	if _, err := s.putOwn(ctx, existing); err != nil {
 		return false, err
 	}
-	s.noteOwnRevision(docID, newRev)
 	return true, nil
 }
 

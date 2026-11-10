@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -37,11 +38,11 @@ type LocalWatcher struct {
 	debounceDur    time.Duration
 	rescanInterval time.Duration
 	syncHidden     bool
-	pendingRemoves map[string]*time.Timer
+	// pendingRemoves holds each removed path with the time its debounce ends.
+	// Only the Run goroutine touches it, so however many removals arrive while
+	// a slow callback runs, none is dropped.
+	pendingRemoves map[string]time.Time
 	watchedDirs    map[string]struct{}
-	// removeFired receives paths from expired debounce timers. All map access
-	// stays in the Run goroutine; timer goroutines only do a channel send.
-	removeFired chan string
 }
 
 // NewLocalWatcher creates a new LocalWatcher.
@@ -53,9 +54,8 @@ func NewLocalWatcher(dir string, suppress *SuppressSet, onChange func(string, fs
 		onRemove:       onRemove,
 		debounceDur:    defaultDebounceDur,
 		rescanInterval: defaultRescanInterval,
-		pendingRemoves: make(map[string]*time.Timer),
+		pendingRemoves: make(map[string]time.Time),
 		watchedDirs:    make(map[string]struct{}),
-		removeFired:    make(chan string, 32),
 	}
 	for _, o := range opts {
 		o(w)
@@ -85,6 +85,8 @@ func (w *LocalWatcher) Run(ctx context.Context) error {
 		rescanC = rescanTicker.C
 		defer rescanTicker.Stop()
 	}
+	removeTicker := time.NewTicker(w.removeCheckInterval())
+	defer removeTicker.Stop()
 
 	for {
 		select {
@@ -100,11 +102,8 @@ func (w *LocalWatcher) Run(ctx context.Context) error {
 			if err := w.addDirRecursive(fw, w.dir); err != nil {
 				fmt.Fprintf(os.Stderr, "fs watcher: rescan: %v\n", err)
 			}
-		case path := <-w.removeFired:
-			delete(w.pendingRemoves, path)
-			if w.onRemove != nil && !w.suppress.IsSuppressed(path) {
-				w.onRemove(path)
-			}
+		case <-removeTicker.C:
+			w.flushDueRemoves()
 		case err, ok := <-fw.Errors:
 			if !ok {
 				return nil
@@ -216,16 +215,42 @@ func (w *LocalWatcher) handleEvent(fw *fsnotify.Watcher, event fsnotify.Event) {
 		if w.suppress.IsSuppressed(event.Name) {
 			return
 		}
-		if t, ok := w.pendingRemoves[event.Name]; ok {
-			t.Stop()
+		w.pendingRemoves[event.Name] = time.Now().Add(w.debounceDur)
+	}
+}
+
+// removeCheckInterval is how often due removals are looked for: a fraction of
+// the debounce, so a removal fires close to when its debounce ends.
+func (w *LocalWatcher) removeCheckInterval() time.Duration {
+	d := w.debounceDur / 4
+	if d < 5*time.Millisecond {
+		return 5 * time.Millisecond
+	}
+	if d > 100*time.Millisecond {
+		return 100 * time.Millisecond
+	}
+	return d
+}
+
+// flushDueRemoves reports every removal whose debounce has ended, parents
+// before their children.
+func (w *LocalWatcher) flushDueRemoves() {
+	if len(w.pendingRemoves) == 0 {
+		return
+	}
+	now := time.Now()
+	var due []string
+	for path, at := range w.pendingRemoves {
+		if !now.Before(at) {
+			due = append(due, path)
 		}
-		path := event.Name
-		w.pendingRemoves[path] = time.AfterFunc(w.debounceDur, func() {
-			select {
-			case w.removeFired <- path:
-			default:
-			}
-		})
+	}
+	sort.Strings(due)
+	for _, path := range due {
+		delete(w.pendingRemoves, path)
+		if w.onRemove != nil && !w.suppress.IsSuppressed(path) {
+			w.onRemove(path)
+		}
 	}
 }
 
@@ -256,15 +281,9 @@ func isProtectedName(name string) bool {
 }
 
 func (w *LocalWatcher) cancelPendingRemove(path string) {
-	if t, ok := w.pendingRemoves[path]; ok {
-		t.Stop()
-		delete(w.pendingRemoves, path)
-	}
+	delete(w.pendingRemoves, path)
 }
 
 func (w *LocalWatcher) cancelAllPendingRemoves() {
-	for path, t := range w.pendingRemoves {
-		t.Stop()
-		delete(w.pendingRemoves, path)
-	}
+	clear(w.pendingRemoves)
 }

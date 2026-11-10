@@ -67,6 +67,20 @@ uploaded again, and a revision obgo wrote itself is not applied back to disk.
 Without this, a device that fell behind on file events kept re-uploading the
 notes it had just pulled, and every other device echoed them in turn.
 
+A pull does not replace a note that changed locally after the remote version
+was written. obgo records the modification time each note had when it last
+matched its document. A note that changed since then and is newer than the
+incoming revision is kept and uploaded; so is a note edited while obgo was
+stopped, which has no record and is compared by modification time alone. A
+remote deletion removes a note unless it is on record as changed since it was
+last in sync. Pulled notes take the modification time of their document, so the
+first start after an upgrade changes the modification time of most notes once.
+A revision older than the one obgo last wrote to a document is ignored.
+
+Local removals are never dropped, however many arrive at once. A removed or
+moved folder is resolved against an in-memory index of note paths, which the
+startup pull fills, instead of a listing of the whole database per folder.
+
 Ownership is persisted in `.obgo_internal_paths` so hashed deletions work across
 restarts. Failed remote events (including conflicts, unavailable chunks and
 unsupported embedded `eden` chunks) are retained with their error in
@@ -132,7 +146,7 @@ obgo push --watch
 
 ### Command semantics
 
-**`pull [path]`** treats CouchDB as the source of truth. Without a path every remote document is written to the local vault, and files whose remote document is deleted are removed locally. Provide a vault-relative file path to pull only that file, or a path ending with `/` to pull an entire folder.
+**`pull [path]`** treats CouchDB as the source of truth. Without a path every remote document is written to the local vault, and files whose remote document is deleted are removed locally. The one exception is a local file that is newer than its remote version: it is kept and uploaded. Provide a vault-relative file path to pull only that file, or a path ending with `/` to pull an entire folder.
 
 **`push [path]`** treats the local vault as the source of truth. Without a path all local files are upserted to CouchDB; files present in CouchDB but absent locally are tombstoned remotely. Provide a file path or a folder path ending with `/` to restrict the operation to that subset.
 

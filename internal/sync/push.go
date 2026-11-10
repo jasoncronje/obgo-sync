@@ -277,6 +277,12 @@ func (s *Service) pushFile(ctx context.Context, absPath string) error {
 		return s.pushInternalFile(ctx, absPath, relPath)
 	}
 
+	// Taken before the read: if the file changes while it is being uploaded,
+	// the time on record no longer matches and the file counts as changed.
+	before, err := os.Stat(absPath)
+	if err != nil {
+		return fmt.Errorf("read %q: %w", absPath, err)
+	}
 	content, err := os.ReadFile(absPath)
 	if err != nil {
 		return fmt.Errorf("read %q: %w", absPath, err)
@@ -305,12 +311,10 @@ func (s *Service) pushFile(ctx context.Context, absPath string) error {
 		return err
 	}
 
-	// Stat the file for timestamps.
-	info, err := os.Stat(absPath)
-	if err != nil {
-		return err
-	}
-	mtime := info.ModTime().UnixMilli()
+	// The document describes what was read: its time is the one taken before
+	// the read and its size is the size of the uploaded content.
+	mtime := before.ModTime().UnixMilli()
+	size := int64(len(content))
 
 	// Fetch existing doc for rev and original ctime.
 	docID := s.encodeDocID(relPath)
@@ -319,6 +323,8 @@ func (s *Service) pushFile(ctx context.Context, absPath string) error {
 	var ctime int64 = mtime
 	if err == nil {
 		if s.holdsContent(ctx, *existing, content, chunkIDs) {
+			s.markSynced(absPath, before.ModTime())
+			s.rememberNote(docID, relPath)
 			return errUnchanged
 		}
 		rev = existing.Rev
@@ -337,7 +343,7 @@ func (s *Service) pushFile(ctx context.Context, absPath string) error {
 	// Build path field: encrypted blob for obfuscated vaults, plain path otherwise.
 	pathField := relPath
 	if s.obfuscated {
-		pathField, err = s.crypto.EncryptPath(relPath, ctime, mtime, info.Size(), chunkIDs)
+		pathField, err = s.crypto.EncryptPath(relPath, ctime, mtime, size, chunkIDs)
 		if err != nil {
 			return fmt.Errorf("encrypt path for %q: %w", relPath, err)
 		}
@@ -350,16 +356,16 @@ func (s *Service) pushFile(ctx context.Context, absPath string) error {
 		Path:      pathField,
 		CTime:     ctime,
 		MTime:     mtime,
-		Size:      info.Size(),
+		Size:      size,
 		Children:  chunkIDs,
 		Eden:      map[string]interface{}{},
 		Encrypted: s.crypto.Enabled(),
 	}
-	newRev, err := s.db.PutMeta(ctx, meta)
-	if err != nil {
+	if _, err := s.putOwn(ctx, meta); err != nil {
 		return fmt.Errorf("put meta %q: %w", relPath, err)
 	}
-	s.noteOwnRevision(docID, newRev)
+	s.markSynced(absPath, before.ModTime())
+	s.rememberNote(docID, relPath)
 	return nil
 }
 
