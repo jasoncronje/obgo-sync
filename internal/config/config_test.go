@@ -85,3 +85,26 @@ func TestLoad_SyncHiddenFalseValues(t *testing.T) {
 		})
 	}
 }
+
+func TestLoad_InternalPush(t *testing.T) {
+	t.Setenv("COUCHDB_URL", "http://admin:password@localhost:5984/vault")
+	t.Setenv("OBGO_DATA", "/tmp/vault")
+	t.Setenv("OBGO_INTERNAL_PUSH", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.InternalPush {
+		t.Error("expected InternalPush to default to false")
+	}
+
+	t.Setenv("OBGO_INTERNAL_PUSH", "true")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.InternalPush {
+		t.Error("expected InternalPush to be true")
+	}
+}

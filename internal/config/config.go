@@ -13,6 +13,7 @@ type Config struct {
 	DataPath        string
 	PathObfuscation string // raw value of OBGO_PATH_OBFUSCATION
 	SyncHidden      bool
+	InternalPush    bool
 }
 
 // PathObfuscationMode normalises OBGO_PATH_OBFUSCATION to one of "auto", "on", "off".
@@ -28,7 +29,7 @@ func (c *Config) PathObfuscationMode() string {
 }
 
 // Load reads COUCHDB_URL, E2EE_PASSWORD, OBGO_DATA, OBGO_PATH_OBFUSCATION,
-// and OBGO_SYNC_HIDDEN from environment.
+// OBGO_SYNC_HIDDEN, and OBGO_INTERNAL_PUSH from environment.
 // Returns error if COUCHDB_URL or OBGO_DATA are empty.
 func Load() (*Config, error) {
 	cfg := &Config{
@@ -37,6 +38,7 @@ func Load() (*Config, error) {
 		DataPath:        os.Getenv("OBGO_DATA"),
 		PathObfuscation: os.Getenv("OBGO_PATH_OBFUSCATION"),
 		SyncHidden:      truthy(os.Getenv("OBGO_SYNC_HIDDEN")),
+		InternalPush:    truthy(os.Getenv("OBGO_INTERNAL_PUSH")),
 	}
 
 	if cfg.CouchDBURL == "" {

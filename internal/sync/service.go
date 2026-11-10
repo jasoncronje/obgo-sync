@@ -30,6 +30,8 @@ type Service struct {
 	obfuscated         bool   // true when the remote vault uses path obfuscation
 	obfuscationMode    string // "auto" | "on" | "off"; set by SetObfuscationMode
 	syncHidden         bool
+	internalPush       bool        // upload hidden paths as LiveSync i: documents
+	internalOwnRevs    stdsync.Map // i: document ID -> revision this process wrote last
 	internalPaths      stdsync.Map // document ID -> local path, for lean watch tombstones
 	internalOwnerPaths stdsync.Map // case-folded local path -> ownership
 	internalOwnerIDs   stdsync.Map // competing ordinary document ID -> ownership
@@ -227,6 +229,9 @@ func (s *Service) Watch(ctx context.Context, watchLocal, watchRemote bool) error
 			if !s.syncHidden {
 				return nil
 			}
+			if s.isOwnRevision(event) {
+				return nil
+			}
 			doc := couchdb.MetaDoc{ID: event.ID, Deleted: event.Deleted}
 			if event.Doc != nil {
 				doc = *event.Doc
@@ -330,6 +335,9 @@ func (s *Service) Watch(ctx context.Context, watchLocal, watchRemote bool) error
 
 	localOnChange := func(path string, op fsnotify.Op) {
 		if err := s.pushFile(ctx, path); err != nil {
+			if errors.Is(err, errInternalUnchanged) {
+				return
+			}
 			fmt.Fprintf(os.Stderr, "watch: push %q: %v\n", path, err)
 			return
 		}
@@ -346,6 +354,12 @@ func (s *Service) Watch(ctx context.Context, watchLocal, watchRemote bool) error
 			return
 		}
 		relPath = filepath.ToSlash(relPath)
+		if s.internalPushEnabled() && isHiddenRelPath(relPath) {
+			if err := s.tombstoneInternalTree(ctx, relPath); err != nil {
+				fmt.Fprintf(os.Stderr, "watch: delete %q: %v\n", relPath, err)
+			}
+			return
+		}
 		owned, err := s.checkInternalOwner(ctx, relPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "watch: ownership check: %v\n", err)

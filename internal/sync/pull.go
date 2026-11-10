@@ -223,10 +223,26 @@ func (s *Service) applyRemoteDoc(ctx context.Context, doc couchdb.MetaDoc) error
 	if shouldSkipLocalPath(doc.Path, "", s.syncHidden) {
 		return nil
 	}
+	content, err := s.readRemoteContent(ctx, doc)
+	if err != nil {
+		return err
+	}
+
+	// Write to disk.
+	absPath := filepath.Join(s.dataDir, filepath.FromSlash(doc.Path))
+	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
+		return fmt.Errorf("mkdir: %w", err)
+	}
+	s.suppress.Add(absPath)
+	return os.WriteFile(absPath, content, 0o644)
+}
+
+// readRemoteContent fetches a meta doc's chunks and assembles the file content.
+func (s *Service) readRemoteContent(ctx context.Context, doc couchdb.MetaDoc) ([]byte, error) {
 	// Fetch chunks.
 	chunks, err := s.db.BulkGet(ctx, doc.Children)
 	if err != nil {
-		return fmt.Errorf("fetch chunks: %w", err)
+		return nil, fmt.Errorf("fetch chunks: %w", err)
 	}
 
 	// Build a map for ordering; BulkGet does not guarantee order.
@@ -241,7 +257,7 @@ func (s *Service) applyRemoteDoc(ctx context.Context, doc couchdb.MetaDoc) error
 	for _, id := range doc.Children {
 		chunk, ok := chunkMap[id]
 		if !ok {
-			return fmt.Errorf("missing chunk %q", id)
+			return nil, fmt.Errorf("missing chunk %q", id)
 		}
 		data := chunk.Data
 
@@ -257,7 +273,7 @@ func (s *Service) applyRemoteDoc(ctx context.Context, doc couchdb.MetaDoc) error
 		if s.crypto.Enabled() && chunk.Encrypted {
 			piece, err = s.crypto.DecryptContent(data)
 			if err != nil {
-				return fmt.Errorf("decrypt chunk %q: %w", id, err)
+				return nil, fmt.Errorf("decrypt chunk %q: %w", id, err)
 			}
 		} else {
 			piece = []byte(data)
@@ -267,18 +283,11 @@ func (s *Service) applyRemoteDoc(ctx context.Context, doc couchdb.MetaDoc) error
 			// Binary file: chunks are base64-encoded (either raw or inside ciphertext).
 			decoded, err := base64.StdEncoding.DecodeString(string(piece))
 			if err != nil {
-				return fmt.Errorf("decode chunk %q: %w", id, err)
+				return nil, fmt.Errorf("decode chunk %q: %w", id, err)
 			}
 			piece = decoded
 		}
 		content = append(content, piece...)
 	}
-
-	// Write to disk.
-	absPath := filepath.Join(s.dataDir, filepath.FromSlash(doc.Path))
-	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
-		return fmt.Errorf("mkdir: %w", err)
-	}
-	s.suppress.Add(absPath)
-	return os.WriteFile(absPath, content, 0o644)
+	return content, nil
 }

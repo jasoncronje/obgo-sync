@@ -27,6 +27,7 @@ The app is configured via environment variables (or a `.env` file in the working
 | `OBGO_DATA`     | yes      | Absolute path to the local vault directory on disk. |
 | `OBGO_PATH_OBFUSCATION` | no | Set to `on`, `off`, or `auto` (default). When enabled, file paths and metadata are encrypted in CouchDB. Only applicable when `E2EE_PASSWORD` is set. |
 | `OBGO_SYNC_HIDDEN` | no | Set to `true` to sync dotfiles and receive LiveSync `i:` hidden-file documents. Internal `.obgo*` paths and `.git` are always ignored. |
+| `OBGO_INTERNAL_PUSH` | no | Set to `true` together with `OBGO_SYNC_HIDDEN` to upload local hidden-file changes and deletions as LiveSync `i:` documents. |
 
 LiveSync `i:` documents are supported for pull and remote watch only. Paths are
 mapped into the vault after decryption; chunk bodies use the existing decoder.
@@ -36,6 +37,21 @@ watch consistently ignore competing ordinary documents at that path. Explicit
 pushes of owned paths fail with a receive-only error; bulk pushes skip them and
 local watch refuses their uploads and deletions. Ordinary files retain their
 existing upload behavior. This does not add bidirectional `i:` support.
+
+`OBGO_INTERNAL_PUSH=true` adds the other direction. Every hidden path is then
+uploaded as an `i:` document and never as an ordinary one: an existing document
+for the path is updated in place, a new hidden file gets a new `i:` document,
+and a removed file is tombstoned the way LiveSync does it. A file whose content
+already matches its document is not uploaded, so pulled files are not echoed
+back. `.DS_Store`, `.git`, `.obgo*`, `.trash`, `node_modules`,
+`obsidian-livesync` and paths that cross a local symlink are never uploaded.
+Documents with unresolved conflicts are left for LiveSync.
+
+As LiveSync does, an `i:` document keeps a readable `path`, `mtime`, `size` and
+`children` even when path obfuscation is on; only its ID is hashed and its
+chunks encrypted. `pull` still writes the remote version over the local one, so
+a hidden file edited while obgo is stopped or still running its startup pull
+is replaced by the remote copy.
 
 Ownership is persisted in `.obgo_internal_paths` so hashed deletions work across
 restarts. Failed remote events (including conflicts, unavailable chunks and

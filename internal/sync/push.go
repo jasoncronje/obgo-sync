@@ -45,6 +45,29 @@ func (s *Service) Push(ctx context.Context, filter string) error {
 
 	// 3. Single-file shortcut.
 	if filter != "" && !strings.HasSuffix(filter, "/") {
+		if s.internalPushEnabled() && isHiddenRelPath(filter) {
+			absPath := filepath.Join(s.dataDir, filepath.FromSlash(filter))
+			if _, err := os.Lstat(absPath); err != nil {
+				done, terr := s.tombstoneInternal(ctx, filter)
+				if terr != nil {
+					return fmt.Errorf("push: tombstone %q: %w", filter, terr)
+				}
+				if done && s.OnTombstone != nil {
+					s.OnTombstone(filter)
+				}
+				return nil
+			}
+			if err := s.pushInternalFile(ctx, absPath, filter); err != nil {
+				if errors.Is(err, errInternalUnchanged) {
+					return nil
+				}
+				return err
+			}
+			if s.OnPushFile != nil {
+				s.OnPushFile(1)
+			}
+			return nil
+		}
 		owned, err := s.checkInternalOwner(ctx, filter)
 		if err != nil {
 			return err
@@ -110,13 +133,16 @@ func (s *Service) Push(ctx context.Context, filter string) error {
 		}
 		relPath, _ := filepath.Rel(s.dataDir, path)
 		relPath = filepath.ToSlash(relPath)
-		if s.internalOwns(relPath) {
+		if s.internalOwns(relPath) && !s.internalPushEnabled() {
 			return nil
 		}
 		if shouldSkipLocalPath(relPath, walkFilter, s.syncHidden) {
 			return nil
 		}
 		if err := s.pushFile(ctx, path); err != nil {
+			if errors.Is(err, errInternalUnchanged) {
+				return nil
+			}
 			return err
 		}
 		pushedPaths[relPath] = struct{}{}
@@ -232,16 +258,21 @@ func (s *Service) ensureSalt(ctx context.Context) error {
 // Chunk IDs are computed with crypto.ChunkID, which uses xxHash-64 of
 // "${data}-${charCount}" encoded as base36 — matching Obsidian's algorithm.
 func (s *Service) pushFile(ctx context.Context, absPath string) error {
-	content, err := os.ReadFile(absPath)
-	if err != nil {
-		return fmt.Errorf("read %q: %w", absPath, err)
-	}
-
 	relPath, err := filepath.Rel(s.dataDir, absPath)
 	if err != nil {
 		return err
 	}
 	relPath = filepath.ToSlash(relPath)
+	// With internal push on, every hidden path belongs to an i: document and
+	// is never uploaded as an ordinary one.
+	if s.internalPushEnabled() && isHiddenRelPath(relPath) {
+		return s.pushInternalFile(ctx, absPath, relPath)
+	}
+
+	content, err := os.ReadFile(absPath)
+	if err != nil {
+		return fmt.Errorf("read %q: %w", absPath, err)
+	}
 	owned, err := s.checkInternalOwner(ctx, relPath)
 	if err != nil {
 		return err
@@ -261,44 +292,9 @@ func (s *Service) pushFile(ctx context.Context, absPath string) error {
 	//
 	// Obsidian plain:   split UTF-8 text at 1000 code points
 	// Obsidian newnote: base64-encode full file, split at 102400 chars
-	var dataChunks []string
-	if isText {
-		dataChunks = livesync.SplitText(string(content), 0)
-	} else {
-		encoded := base64.StdEncoding.EncodeToString(content)
-		for len(encoded) > 0 {
-			size := livesync.DefaultChunkSize
-			if size > len(encoded) {
-				size = len(encoded)
-			}
-			dataChunks = append(dataChunks, encoded[:size])
-			encoded = encoded[size:]
-		}
-	}
-
-	chunkIDs := make([]string, 0, len(dataChunks))
-	chunkDocs := make([]interface{}, 0, len(dataChunks))
-
-	for _, chunk := range dataChunks {
-		id := s.crypto.ChunkID(chunk)
-		chunkIDs = append(chunkIDs, id)
-
-		var data string
-		if s.crypto.Enabled() {
-			data, err = s.crypto.EncryptContent([]byte(chunk))
-			if err != nil {
-				return fmt.Errorf("encrypt chunk: %w", err)
-			}
-		} else {
-			data = chunk
-		}
-
-		chunkDocs = append(chunkDocs, &couchdb.ChunkDoc{
-			ID:        id,
-			Data:      data,
-			Type:      "leaf",
-			Encrypted: s.crypto.Enabled(),
-		})
+	chunkIDs, chunkDocs, err := s.encodeChunks(content, isText)
+	if err != nil {
+		return err
 	}
 
 	// Upload chunks.
